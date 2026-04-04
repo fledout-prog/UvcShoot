@@ -309,6 +309,8 @@ static void renderMjpegFrame(NativeContext* ctx,
     }
 
     jpeg_create_decompress(&cinfo);
+    /* jpeg_mem_src takes unsigned char* (not const) per the libjpeg API, but
+     * does not modify the buffer.  The const_cast is safe here. */
     jpeg_mem_src(&cinfo,
                  const_cast<unsigned char*>(normalData),
                  static_cast<unsigned long>(normalLen));
