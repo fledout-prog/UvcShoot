@@ -72,18 +72,26 @@ class MainActivity : AppCompatActivity() {
 
     private val surfaceCallback = object : SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {
-            Log.d(TAG, "surfaceCreated")
+            Log.d(
+                TAG,
+                "surfaceCreated — serviceBound=$serviceBound " +
+                    "streaming=${cameraService?.isStreaming()}"
+            )
             cameraService?.attachSurface(holder.surface)
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-            Log.d(TAG, "surfaceChanged ${width}x${height}")
+            Log.d(
+                TAG,
+                "surfaceChanged ${width}x${height} — serviceBound=$serviceBound " +
+                    "streaming=${cameraService?.isStreaming()}"
+            )
             // Re-attach so the native window is refreshed with the new dimensions.
             cameraService?.attachSurface(holder.surface)
         }
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
-            Log.d(TAG, "surfaceDestroyed")
+            Log.d(TAG, "surfaceDestroyed — serviceBound=$serviceBound")
             cameraService?.detachSurface()
         }
     }
@@ -110,6 +118,24 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         bindToService()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Deterministic recovery point: after returning from standby or
+        // background the surface may have been recreated and the stream may
+        // need a restart.  If the service is already bound and the surface is
+        // valid, ask the controller to recover.
+        val holder = previewSurface.holder
+        val surfaceValid = holder.surface.isValid
+        Log.d(
+            TAG,
+            "onResume — serviceBound=$serviceBound surfaceValid=$surfaceValid " +
+                "streaming=${cameraService?.isStreaming()}"
+        )
+        if (serviceBound && surfaceValid) {
+            cameraService?.recoverPreviewIfNeeded()
+        }
     }
 
     override fun onStop() {
