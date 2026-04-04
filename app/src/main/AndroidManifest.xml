@@ -3,6 +3,14 @@
 
     <uses-feature android:name="android.hardware.usb.host" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!--
+        FOREGROUND_SERVICE_CONNECTED_DEVICE is required on Android 14+ when
+        foregroundServiceType="connectedDevice" is declared.  USB/UVC cameras
+        are accessed via a raw file-descriptor (not the Android Camera API),
+        so "connectedDevice" is the appropriate service type.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
     <application
         android:allowBackup="true"
@@ -16,12 +24,23 @@
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:screenOrientation="landscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            CameraService keeps the USB/UVC pipeline alive in the background.
+            foregroundServiceType="connectedDevice" is required on API 29+ for
+            services that interact with a connected external device (USB, BT…).
+        -->
+        <service
+            android:name=".CameraService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
 
     </application>
 </manifest>

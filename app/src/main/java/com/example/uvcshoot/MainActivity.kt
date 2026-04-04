@@ -1,15 +1,96 @@
 package com.example.uvcshoot
 
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
+import android.util.Log
+import android.view.KeyEvent
+import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.widget.Button
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 
+/**
+ * Camera preview Activity.  No longer owns the camera lifecycle; it binds
+ * to [CameraService] and acts only as a surface/UI bridge.
+ *
+ * Lifecycle contract:
+ *  - onStart  → start + bind to [CameraService]
+ *  - onStop   → unbind (service continues in background)
+ *  - SurfaceHolder.Callback → attach/detach preview surface via service API
+ *  - onKeyDown (volume-down / KEYCODE_CAMERA) → trigger capture
+ */
 class MainActivity : AppCompatActivity() {
+
+    companion object {
+        private const val TAG = "MainActivity"
+    }
 
     private lateinit var previewSurface: SurfaceView
     private lateinit var captureButton: Button
-    private lateinit var uvcController: UvcController
+    private lateinit var statusText: TextView
+
+    private var cameraService: CameraService? = null
+    private var serviceBound = false
+
+    // -----------------------------------------------------------------------
+    // Service connection
+    // -----------------------------------------------------------------------
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            Log.d(TAG, "onServiceConnected")
+            cameraService = (binder as CameraService.LocalBinder).getService()
+            serviceBound = true
+
+            // If the SurfaceView already has a valid surface (e.g., quick
+            // resume), attach it immediately so preview starts right away.
+            val holder = previewSurface.holder
+            if (holder.surface != null && holder.surface.isValid) {
+                Log.d(TAG, "onServiceConnected: surface already valid — attaching")
+                cameraService?.attachSurface(holder.surface)
+            }
+            updateStatus("Camera service connected")
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) {
+            Log.d(TAG, "onServiceDisconnected")
+            cameraService = null
+            serviceBound = false
+            updateStatus("Camera service disconnected")
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SurfaceHolder callbacks — routed to the service
+    // -----------------------------------------------------------------------
+
+    private val surfaceCallback = object : SurfaceHolder.Callback {
+        override fun surfaceCreated(holder: SurfaceHolder) {
+            Log.d(TAG, "surfaceCreated")
+            cameraService?.attachSurface(holder.surface)
+        }
+
+        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            Log.d(TAG, "surfaceChanged ${width}x${height}")
+            // Re-attach so the native window is refreshed with the new dimensions.
+            cameraService?.attachSurface(holder.surface)
+        }
+
+        override fun surfaceDestroyed(holder: SurfaceHolder) {
+            Log.d(TAG, "surfaceDestroyed")
+            cameraService?.detachSurface()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Activity lifecycle
+    // -----------------------------------------------------------------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -17,26 +98,81 @@ class MainActivity : AppCompatActivity() {
 
         previewSurface = findViewById(R.id.previewSurface)
         captureButton = findViewById(R.id.captureButton)
+        statusText = findViewById(R.id.statusText)
 
-        uvcController = UvcController(this, previewSurface)
+        previewSurface.holder.addCallback(surfaceCallback)
 
-        captureButton.setOnClickListener {
-            uvcController.requestCapture()
+        captureButton.setOnClickListener { triggerCapture() }
+
+        updateStatus("Starting camera service…")
+    }
+
+    override fun onStart() {
+        super.onStart()
+        startAndBindService()
+    }
+
+    override fun onStop() {
+        if (serviceBound) {
+            // Detach surface — service keeps the camera pipeline alive.
+            cameraService?.detachSurface()
+            unbindService(serviceConnection)
+            serviceBound = false
+            cameraService = null
+            Log.d(TAG, "onStop: unbound from service — pipeline continues in background")
         }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        uvcController.onResume()
-    }
-
-    override fun onPause() {
-        uvcController.onPause()
-        super.onPause()
+        super.onStop()
     }
 
     override fun onDestroy() {
-        uvcController.release()
+        previewSurface.holder.removeCallback(surfaceCallback)
         super.onDestroy()
+    }
+
+    // -----------------------------------------------------------------------
+    // Hardware trigger support
+    // -----------------------------------------------------------------------
+
+    /**
+     * Intercept hardware key events that may be used as a physical capture
+     * trigger (volume-down, dedicated camera button).  When a trigger key is
+     * pressed the capture command is forwarded to [CameraService].
+     */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        return when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_DOWN,
+            KeyEvent.KEYCODE_CAMERA -> {
+                Log.d(TAG, "Hardware key trigger: keyCode=$keyCode")
+                triggerCapture()
+                true
+            }
+            else -> super.onKeyDown(keyCode, event)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    private fun triggerCapture() {
+        Log.d(TAG, "triggerCapture — serviceBound=$serviceBound")
+        cameraService?.requestCapture()
+            ?: Log.w(TAG, "triggerCapture: service not yet bound")
+        updateStatus("Capture requested")
+    }
+
+    private fun startAndBindService() {
+        val intent = Intent(this, CameraService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        Log.d(TAG, "startAndBindService")
+    }
+
+    private fun updateStatus(msg: String) {
+        statusText.text = msg
     }
 }
