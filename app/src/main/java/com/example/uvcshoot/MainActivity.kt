@@ -4,7 +4,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
@@ -20,8 +19,9 @@ import androidx.appcompat.app.AppCompatActivity
  * to [CameraService] and acts only as a surface/UI bridge.
  *
  * Lifecycle contract:
- *  - onStart  → start + bind to [CameraService]
- *  - onStop   → unbind (service continues in background)
+ *  - onStart  → bind to [CameraService] (service is NOT started here;
+ *               it promotes itself to foreground once a USB device is engaged)
+ *  - onStop   → unbind (service continues in background if already foreground)
  *  - SurfaceHolder.Callback → attach/detach preview surface via service API
  *  - onKeyDown (volume-down / KEYCODE_CAMERA) → trigger capture
  */
@@ -109,7 +109,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        startAndBindService()
+        bindToService()
     }
 
     override fun onStop() {
@@ -161,15 +161,23 @@ class MainActivity : AppCompatActivity() {
         updateStatus("Capture requested")
     }
 
-    private fun startAndBindService() {
+    /**
+     * Only bind to [CameraService]; do NOT start it as a foreground service here.
+     *
+     * The `connectedDevice` foreground-service type requires that
+     * [android.hardware.usb.UsbManager.requestPermission] has already been
+     * called before [android.app.Service.startForeground] is invoked.
+     * Starting the FGS unconditionally at Activity start violates this
+     * requirement and throws a [SecurityException] on modern Android.
+     *
+     * [CameraService] will promote itself to a foreground service (via
+     * [CameraService.promoteToForeground]) only after [UvcController] has
+     * engaged a USB device and satisfied the runtime precondition.
+     */
+    private fun bindToService() {
         val intent = Intent(this, CameraService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
-        Log.d(TAG, "startAndBindService")
+        Log.d(TAG, "bindToService")
     }
 
     private fun updateStatus(msg: String) {
