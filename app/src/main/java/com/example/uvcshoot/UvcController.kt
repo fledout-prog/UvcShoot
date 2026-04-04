@@ -24,7 +24,21 @@ import android.view.Surface
  *
  * All calls are expected on the main thread unless noted otherwise.
  */
-class UvcController(private val context: Context) {
+class UvcController(
+    private val context: Context,
+    /**
+     * Optional callback invoked whenever a UVC device is engaged
+     * (either because permission was already granted or because
+     * [android.hardware.usb.UsbManager.requestPermission] was called).
+     * [CameraService] uses this to promote itself to a foreground service
+     * at the correct moment — after the runtime precondition for the
+     * `connectedDevice` FGS type is satisfied.
+     *
+     * The callback may be invoked more than once (e.g. device detach/reattach
+     * or multiple cameras at startup), so callers must make it idempotent.
+     */
+    private val onUsbDeviceEngaged: (() -> Unit)? = null,
+) {
 
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     private val usbPermissionHelper = UsbPermissionHelper(context)
@@ -97,6 +111,10 @@ class UvcController(private val context: Context) {
                     val device: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                     if (device != null && isLikelyUvcCamera(device)) {
                         Log.d("UVC", "USB device attached: ${device.deviceName}")
+                        // Notify before requestPermission / openDevice so the
+                        // service can promote to foreground while the condition
+                        // (requestPermission called) is being satisfied.
+                        onUsbDeviceEngaged?.invoke()
                         if (usbManager.hasPermission(device)) {
                             pendingCamera = device
                             openUsbConnectionAndSendToNative(device)
@@ -311,6 +329,10 @@ class UvcController(private val context: Context) {
             logUsbDevice(device)
             if (isLikelyUvcCamera(device)) {
                 Log.d("UVC", "Possible UVC camera: ${device.deviceName}")
+                // Notify before any permission/open work so the service can
+                // promote to foreground while the runtime precondition for the
+                // connectedDevice FGS type is being satisfied.
+                onUsbDeviceEngaged?.invoke()
                 if (usbManager.hasPermission(device)) {
                     Log.d("UVC", "USB permission already granted for ${device.deviceName}")
                     pendingCamera = device

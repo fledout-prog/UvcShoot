@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -17,8 +18,12 @@ import androidx.core.app.NotificationCompat
  * Persistent foreground service that owns the USB/UVC camera pipeline.
  *
  * Design contract:
- *  - Starts as a foreground service so Android will not kill it when the
- *    Activity goes to the background.
+ *  - Initially starts as a bound service (via [android.content.Context.bindService]).
+ *    It promotes itself to a foreground service ([promoteToForeground]) only
+ *    once [UvcController] has engaged a USB device; this satisfies the
+ *    runtime precondition for the `connectedDevice` FGS type and avoids the
+ *    [SecurityException] that would occur if [startForeground] were called
+ *    before [android.hardware.usb.UsbManager.requestPermission].
  *  - The Activity binds to this service to get a [LocalBinder] reference.
  *  - [attachSurface] / [detachSurface] are called by the Activity when its
  *    SurfaceView is created/destroyed.  The camera pipeline continues
@@ -50,15 +55,23 @@ class CameraService : Service() {
     // -----------------------------------------------------------------------
     private lateinit var uvcController: UvcController
 
+    /** Guards against calling startForeground() more than once. */
+    private var isForeground = false
+
     // -----------------------------------------------------------------------
     // Service lifecycle
     // -----------------------------------------------------------------------
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "onCreate — starting foreground notification and camera controller")
-        uvcController = UvcController(applicationContext)
-        startForeground(NOTIFICATION_ID, buildNotification())
+        Log.d(TAG, "onCreate — initialising camera controller")
+        // Pass a callback so UvcController can promote us to foreground the
+        // moment a USB device is engaged (permission requested or already
+        // granted).  This satisfies the Android runtime precondition for the
+        // connectedDevice foreground-service type and avoids the
+        // SecurityException that occurs when startForeground() is called
+        // before any USB device interaction.
+        uvcController = UvcController(applicationContext, onUsbDeviceEngaged = ::promoteToForeground)
         uvcController.start()
     }
 
@@ -96,6 +109,38 @@ class CameraService : Service() {
     // -----------------------------------------------------------------------
     // Public API — called through LocalBinder by the Activity
     // -----------------------------------------------------------------------
+
+    /**
+     * Promote the service to a foreground service now that a USB device has
+     * been engaged (permission requested or already granted).  This is the
+     * earliest safe moment to call [startForeground] for the
+     * `connectedDevice` type, because Android requires that
+     * [android.hardware.usb.UsbManager.requestPermission] has been called
+     * before [startForeground] is invoked with that type.
+     *
+     * Also calls [startService] on this service so it becomes a "started"
+     * service and survives after all clients unbind (i.e. the Activity goes
+     * to the background), which is the desired always-on behaviour.
+     *
+     * Idempotent — does nothing if already in foreground.
+     */
+    internal fun promoteToForeground() {
+        if (isForeground) return
+        isForeground = true
+        Log.d(TAG, "promoteToForeground — USB device engaged, promoting to foreground")
+        // Make the service a started service so it lives beyond client unbind.
+        startService(Intent(this, CameraService::class.java))
+        // Promote to foreground; on API 29+ supply the explicit service type.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
+    }
 
     /** Attach the Activity's preview Surface; frames will be rendered onto it. */
     fun attachSurface(surface: Surface) {
