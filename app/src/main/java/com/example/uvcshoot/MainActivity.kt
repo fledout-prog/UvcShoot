@@ -2,12 +2,12 @@ package com.example.uvcshoot
 
 import android.os.Bundle
 import android.widget.Button
-import android.widget.ImageView
+import android.view.SurfaceView
 import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var previewImage: ImageView
+    private lateinit var previewSurface: SurfaceView
     private lateinit var captureButton: Button
     private lateinit var uvcController: UvcController
 
@@ -15,10 +15,10 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        previewImage = findViewById(R.id.previewImage)
+        previewSurface = findViewById(R.id.previewSurface)
         captureButton = findViewById(R.id.captureButton)
 
-        uvcController = UvcController(this, previewImage)
+        uvcController = UvcController(this, previewSurface)
 
         captureButton.setOnClickListener {
             uvcController.requestCapture()
