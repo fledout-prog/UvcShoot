@@ -19,8 +19,12 @@ import android.view.Surface
  * Surface lifecycle is decoupled from camera lifecycle:
  *  - [attachSurface] / [detachSurface] can be called independently of
  *    [start] / [release].
- *  - When no surface is attached, frames are silently dropped in native
- *    code; the camera pipeline stays open for immediate capture readiness.
+ *  - On [detachSurface] the MJPEG stream is stopped and [streaming] is reset
+ *    to `false`; the USB connection and UVC context remain open so the camera
+ *    does not need to be re-probed on the next [attachSurface].
+ *  - [recoverPreviewIfNeeded] is the primary post-standby recovery entry
+ *    point: it re-starts the stream if camera is ready, or re-opens the
+ *    camera if USB state was lost.
  *
  * All calls are expected on the main thread unless noted otherwise.
  */
@@ -157,28 +161,98 @@ class UvcController(
     }
 
     /**
-     * Attach a preview [Surface].  Sets [surfaceReady] and calls
-     * [tryStartStream].  Safe to call repeatedly (e.g., on surfaceChanged).
+     * Attach a preview [Surface].  Sets [surfaceReady], passes the surface to
+     * the native layer, and calls [tryStartStream].  Acts as a deterministic
+     * recovery point: safe to call on every [surfaceCreated] / [surfaceChanged]
+     * even after standby, because [detachSurface] already stopped the stream.
      */
     fun attachSurface(surface: Surface) {
-        Log.d("UVC", "attachSurface: surfaceReady=true streaming=$streaming")
+        Log.d(
+            "UVC",
+            "attachSurface: cameraReady=$cameraReady streaming=$streaming " +
+                "surfaceReady=$surfaceReady nativeHandle=$nativeHandle"
+        )
         surfaceReady = true
         if (nativeHandle != 0L) {
             NativeBridge.nativeSetSurface(nativeHandle, surface)
+            Log.d("UVC", "attachSurface: surface attached to native — calling tryStartStream")
             tryStartStream()
+        } else {
+            Log.w("UVC", "attachSurface: native handle not ready — stream deferred until camera opens")
         }
     }
 
     /**
-     * Detach the current preview Surface without stopping the camera or stream.
-     * The native layer will silently drop frames until a surface is re-attached.
-     * This keeps the camera pipeline alive for background capture readiness.
+     * Detach the current preview Surface and stop the MJPEG stream.
+     *
+     * Stopping the stream explicitly (rather than silently dropping frames)
+     * ensures [streaming] is `false` when the surface comes back, so
+     * [attachSurface] → [tryStartStream] performs a clean restart.
+     * The camera pipeline (USB connection + UVC context) remains open for
+     * immediate capture readiness — only the render stream is paused.
      */
     fun detachSurface() {
-        Log.d("UVC", "detachSurface: surfaceReady=false — pipeline stays alive")
+        Log.d(
+            "UVC",
+            "detachSurface: streaming=$streaming cameraReady=$cameraReady — stopping stream, camera stays open"
+        )
         surfaceReady = false
         if (nativeHandle != 0L) {
+            if (streaming) {
+                NativeBridge.nativeStopStream(nativeHandle)
+                streaming = false
+                Log.d("UVC", "detachSurface: stream stopped")
+            }
             NativeBridge.nativeSetSurface(nativeHandle, null)
+        }
+    }
+
+    /**
+     * Inspect the current camera/stream/surface state and attempt to recover
+     * preview if something is out of sync.  This is the primary recovery entry
+     * point called by [CameraService] on Activity resume and after a standby
+     * cycle.
+     *
+     * Decision table:
+     * - surface not ready  → nothing to do (surface callback will trigger later)
+     * - cameraReady && !streaming → restart stream (most common post-standby case)
+     * - !cameraReady && USB device reachable with permission → reopen camera
+     * - !cameraReady && USB device present without permission → re-request permission
+     * - already streaming → log and skip
+     */
+    fun recoverPreviewIfNeeded() {
+        Log.d(
+            "UVC",
+            "recoverPreviewIfNeeded: cameraReady=$cameraReady streaming=$streaming " +
+                "surfaceReady=$surfaceReady nativeHandle=$nativeHandle"
+        )
+        when {
+            !surfaceReady -> {
+                Log.d("UVC", "recoverPreviewIfNeeded: surface not attached — nothing to recover yet")
+            }
+            cameraReady && streaming -> {
+                Log.d("UVC", "recoverPreviewIfNeeded: already streaming — no action needed")
+            }
+            cameraReady && !streaming -> {
+                Log.d("UVC", "recoverPreviewIfNeeded: camera ready but stream inactive — restarting stream")
+                tryStartStream()
+            }
+            !cameraReady -> {
+                Log.d("UVC", "recoverPreviewIfNeeded: camera not ready — scanning for USB device")
+                val device = findUvcDevice()
+                if (device != null) {
+                    if (usbManager.hasPermission(device)) {
+                        Log.d("UVC", "recoverPreviewIfNeeded: USB device found with permission — reopening camera")
+                        pendingCamera = device
+                        openUsbConnectionAndSendToNative(device)
+                    } else {
+                        Log.d("UVC", "recoverPreviewIfNeeded: USB device found but no permission — re-requesting")
+                        usbPermissionHelper.requestPermission(usbManager, device)
+                    }
+                } else {
+                    Log.w("UVC", "recoverPreviewIfNeeded: no UVC device found — cannot recover")
+                }
+            }
         }
     }
 
@@ -344,6 +418,10 @@ class UvcController(
             }
         }
     }
+
+    /** Returns the first connected UVC camera found in the USB device list, or null. */
+    private fun findUvcDevice(): UsbDevice? =
+        usbManager.deviceList.values.firstOrNull { isLikelyUvcCamera(it) }
 
     private fun isLikelyUvcCamera(device: UsbDevice): Boolean {
         if (device.deviceClass == UsbConstants.USB_CLASS_VIDEO) return true

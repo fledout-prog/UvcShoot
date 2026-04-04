@@ -20,9 +20,9 @@ import android.view.Surface
  *    promotion path is implemented.
  *  - The Activity binds to this service to get a [LocalBinder] reference.
  *  - [attachSurface] / [detachSurface] are called by the Activity when its
- *    SurfaceView is created/destroyed.  The camera pipeline continues
- *    running without a surface; frames are silently dropped by the native
- *    layer until a surface is re-attached.
+ *    SurfaceView is created/destroyed.  On detach the MJPEG stream is stopped
+ *    and restarted cleanly on the next [attachSurface]; the USB/UVC context
+ *    stays open so there is no camera re-open overhead on resume.
  *  - Future capture/trigger commands are routed through [requestCapture].
  *  - Returns START_STICKY so the OS will restart the service after a
  *    resource reclaim, subject to Android background execution limits.
@@ -120,8 +120,9 @@ class CameraService : Service() {
     }
 
     /**
-     * Detach the current preview Surface without stopping the camera pipeline.
-     * Subsequent frames are silently dropped in the native layer.
+     * Detach the current preview Surface and stop the active MJPEG stream.
+     * The camera pipeline (USB connection + UVC context) remains open so the
+     * next [attachSurface] call cleanly restarts the stream.
      */
     fun detachSurface() {
         Log.d(TAG, "detachSurface")
@@ -136,4 +137,16 @@ class CameraService : Service() {
 
     /** Returns true when the MJPEG stream is active and the camera is open. */
     fun isStreaming(): Boolean = uvcController.isStreaming()
+
+    /**
+     * Inspect and recover preview state after standby, screen-off, or any
+     * condition that may have disrupted the camera/stream/surface alignment.
+     *
+     * Delegates to [UvcController.recoverPreviewIfNeeded].  Safe to call from
+     * [MainActivity.onResume] or any other recovery trigger point.
+     */
+    fun recoverPreviewIfNeeded() {
+        Log.d(TAG, "recoverPreviewIfNeeded — delegating to controller")
+        uvcController.recoverPreviewIfNeeded()
+    }
 }
