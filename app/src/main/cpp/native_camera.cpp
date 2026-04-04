@@ -286,7 +286,16 @@ static void renderMjpegFrame(NativeContext* ctx,
     {
         std::lock_guard<std::mutex> lock(ctx->mutex);
         win = ctx->window;
-        if (!win || !ctx->streamRunning) return;
+        if (!ctx->streamRunning) return;
+        if (!win) {
+            // Surface not yet available; frame is intentionally dropped.
+            // Log once every 60 frames to aid diagnosis without spamming.
+            if ((ctx->frameLogCounter % 60u) == 0u) {
+                LOGD("renderMjpegFrame: no window yet, frame dropped (seq ~%u)",
+                     ctx->frameLogCounter);
+            }
+            return;
+        }
         ANativeWindow_acquire(win);
     }
 
@@ -461,7 +470,7 @@ Java_com_example_uvcshoot_NativeBridge_nativeSetSurface(
     }
 
     ctx->window = ANativeWindow_fromSurface(env, surface);
-    LOGD("nativeSetSurface: new window=%p", ctx->window);
+    LOGD("nativeSetSurface: new window=%p streamRunning=%d", ctx->window, ctx->streamRunning ? 1 : 0);
 }
 
 extern "C"

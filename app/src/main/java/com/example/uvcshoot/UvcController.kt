@@ -27,26 +27,72 @@ class UvcController(
     private var usbConnection: UsbDeviceConnection? = null
 
     private var nativeHandle: Long = 0L
-    private var nativeCameraOpened = false
+
+    // --- Lifecycle state machine ---
+    // Both flags must be true before nativeStartMjpegStream is called.
+    // All reads/writes happen on the main thread, so no explicit locking is needed here.
+    private var cameraReady = false   // true after nativeProbeAndOpenUvc succeeds
+    private var surfaceReady = false  // true while a valid Surface is available
+    private var streaming = false     // true while nativeStartMjpegStream is active
+
+    /**
+     * Gate function: start the MJPEG stream only when both the camera and the
+     * surface are ready and the stream is not already running. This eliminates
+     * the race between USB/camera open and surfaceCreated/surfaceChanged.
+     */
+    private fun tryStartStream() {
+        when {
+            nativeHandle == 0L -> {
+                Log.d("UVC", "tryStartStream: skipped — native handle not initialized")
+                return
+            }
+            streaming -> {
+                Log.d("UVC", "tryStartStream: skipped — already streaming")
+                return
+            }
+            !cameraReady || !surfaceReady -> {
+                Log.d(
+                    "UVC",
+                    "tryStartStream: waiting — cameraReady=$cameraReady surfaceReady=$surfaceReady"
+                )
+                return
+            }
+        }
+        val ok = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
+        streaming = ok
+        Log.d("UVC", "nativeStartMjpegStream result=$ok → streaming=$streaming")
+    }
 
     private val surfaceCallback = object : SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {
-            Log.d("UVC", "surfaceCreated")
+            Log.d("UVC", "surfaceCreated → surfaceReady=true")
+            surfaceReady = true
             if (nativeHandle != 0L) {
                 NativeBridge.nativeSetSurface(nativeHandle, holder.surface)
+                tryStartStream()
             }
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-            Log.d("UVC", "surfaceChanged ${width}x${height} format=$format")
+            Log.d("UVC", "surfaceChanged ${width}x${height} format=$format → surfaceReady=true")
+            surfaceReady = true
             if (nativeHandle != 0L) {
+                // Always refresh the native window (dimensions may have changed).
                 NativeBridge.nativeSetSurface(nativeHandle, holder.surface)
+                // In case camera became ready before the surface appeared, start now.
+                tryStartStream()
             }
         }
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
-            Log.d("UVC", "surfaceDestroyed")
+            Log.d("UVC", "surfaceDestroyed → surfaceReady=false")
+            surfaceReady = false
             if (nativeHandle != 0L) {
+                if (streaming) {
+                    NativeBridge.nativeStopStream(nativeHandle)
+                    streaming = false
+                    Log.d("UVC", "surfaceDestroyed: stream stopped")
+                }
                 NativeBridge.nativeSetSurface(nativeHandle, null)
             }
         }
@@ -89,13 +135,19 @@ class UvcController(
             Log.e("UVC", "Native bridge failed", t)
         }
 
-        // Register surface callback — if the surface already exists, deliver it now
+        // Register surface callback first so we never miss surfaceCreated/surfaceChanged.
         previewSurface.holder.addCallback(surfaceCallback)
-        val surface: Surface? = previewSurface.holder.surface?.takeIf {
+
+        // If the surface is already valid (e.g., activity resumes without the surface
+        // being destroyed), surfaceCreated won't fire again — handle it manually.
+        val existingSurface: Surface? = previewSurface.holder.surface?.takeIf {
             previewSurface.holder.surface.isValid
         }
-        if (surface != null && nativeHandle != 0L) {
-            NativeBridge.nativeSetSurface(nativeHandle, surface)
+        if (existingSurface != null && nativeHandle != 0L) {
+            Log.d("UVC", "onResume: surface already valid → surfaceReady=true")
+            surfaceReady = true
+            NativeBridge.nativeSetSurface(nativeHandle, existingSurface)
+            // tryStartStream() is called once cameraReady is also set (in scanUsbDevices path)
         }
 
         registerUsbReceiver()
@@ -106,10 +158,14 @@ class UvcController(
         Log.d("UVC", "onPause")
         unregisterUsbReceiver()
 
+        // Reset state machine — the stream and camera must be restarted on the next resume.
+        streaming = false
+        cameraReady = false
+        surfaceReady = false
+
         if (nativeHandle != 0L) {
             NativeBridge.nativeStopStream(nativeHandle)
             NativeBridge.nativeCloseUsbCamera(nativeHandle)
-            nativeCameraOpened = false
             NativeBridge.nativeSetSurface(nativeHandle, null)
         }
 
@@ -124,10 +180,13 @@ class UvcController(
     fun release() {
         unregisterUsbReceiver()
 
+        streaming = false
+        cameraReady = false
+        surfaceReady = false
+
         if (nativeHandle != 0L) {
             NativeBridge.nativeStopStream(nativeHandle)
             NativeBridge.nativeCloseUsbCamera(nativeHandle)
-            nativeCameraOpened = false
             NativeBridge.nativeSetSurface(nativeHandle, null)
         }
 
@@ -176,7 +235,6 @@ class UvcController(
         }
 
         val openOk = NativeBridge.nativeOpenUsbCamera(nativeHandle)
-        nativeCameraOpened = openOk
         Log.d("UVC", "nativeOpenUsbCamera result=$openOk")
 
         if (!openOk) {
@@ -191,8 +249,11 @@ class UvcController(
             return
         }
 
-        val streamOk = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
-        Log.d("UVC", "nativeStartMjpegStream result=$streamOk")
+        // Camera is ready. Mark it and let tryStartStream() decide whether to start
+        // streaming now (if the surface is also ready) or defer until surfaceCreated fires.
+        cameraReady = true
+        Log.d("UVC", "cameraReady=true surfaceReady=$surfaceReady → calling tryStartStream")
+        tryStartStream()
     }
 
     private fun closeUsbConnection() {
