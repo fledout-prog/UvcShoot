@@ -26,4 +26,5 @@ object NativeBridge {
     external fun nativeProbeAndOpenUvc(handle: Long): Boolean
     external fun nativeStartMjpegStream(handle: Long, width: Int, height: Int, fps: Int): Boolean
     external fun nativeStopStream(handle: Long)
+    external fun nativeSetDeliverFramesToJava(handle: Long, enable: Boolean)
 }

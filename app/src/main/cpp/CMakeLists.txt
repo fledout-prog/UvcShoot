@@ -6,6 +6,22 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD 11)
 
 # =========================
+# libjpeg-turbo
+# =========================
+set(JPEG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(ENABLE_STATIC ON CACHE BOOL "" FORCE)
+set(WITH_TURBOJPEG ON CACHE BOOL "" FORCE)
+set(WITH_JAVA OFF CACHE BOOL "" FORCE)
+set(WITH_SIMD ON CACHE BOOL "" FORCE)
+
+add_subdirectory(
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libjpeg-turbo
+    ${CMAKE_CURRENT_BINARY_DIR}/libjpeg-turbo-build
+    EXCLUDE_FROM_ALL
+)
+
+# =========================
 # libusb
 # =========================
 add_library(libusb STATIC
@@ -67,12 +83,15 @@ add_library(uvcshoot SHARED
 
 find_library(log-lib log)
 find_library(android-lib android)
+find_library(jnigraphics-lib jnigraphics)
 
 target_include_directories(uvcshoot PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libusb/libusb
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libuvc/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libuvc/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libjpeg-turbo
+    ${CMAKE_CURRENT_BINARY_DIR}/libjpeg-turbo-build
 )
 
 target_compile_definitions(uvcshoot PRIVATE
@@ -82,6 +101,8 @@ target_compile_definitions(uvcshoot PRIVATE
 target_link_libraries(uvcshoot
     ${log-lib}
     ${android-lib}
+    ${jnigraphics-lib}
     libusb
     libuvc
+    turbojpeg-static
 )

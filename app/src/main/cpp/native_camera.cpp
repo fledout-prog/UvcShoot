@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <android/log.h>
 #include <android/native_window_jni.h>
+#include <android/bitmap.h>
+#include <turbojpeg.h>
 
 #include <libusb.h>
 
@@ -46,6 +48,12 @@ struct NativeContext {
     jobject frameListenerGlobalRef = nullptr;
 
     uint32_t frameLogCounter = 0;
+
+    tjhandle tjDecompressor = nullptr;
+    bool deliverFramesToJava = false;
+
+    int lastWindowWidth = 0;
+    int lastWindowHeight = 0;
 };
 
 static bool getEnvForCallback(JNIEnv** env, bool* didAttach) {
@@ -123,73 +131,117 @@ static void mjpegFrameCallback(uvc_frame_t* frame, void* user_ptr) {
     auto* ctx = reinterpret_cast<NativeContext*>(user_ptr);
     if (!ctx || !frame || !frame->data || frame->data_bytes == 0) return;
 
-    JNIEnv* env = nullptr;
-    bool didAttach = false;
-    if (!getEnvForCallback(&env, &didAttach)) {
-        LOGE("Failed to get JNIEnv in frame callback");
-        return;
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+
+    if (!ctx->streamRunning) return;
+
+    ctx->frameLogCounter++;
+    if ((ctx->frameLogCounter % 30u) == 0u) {
+        LOGD(
+                "MJPEG frame callback: format=%u width=%u height=%u bytes=%zu seq=%u",
+                frame->frame_format,
+                frame->width,
+                frame->height,
+                frame->data_bytes,
+                frame->sequence
+        );
     }
 
-    jobject listener = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        if (!ctx->streamRunning || !ctx->frameListenerGlobalRef) {
-            if (didAttach) gJvm->DetachCurrentThread();
+    // Create TurboJPEG decompressor once and reuse it
+    if (!ctx->tjDecompressor) {
+        ctx->tjDecompressor = tjInitDecompress();
+        if (!ctx->tjDecompressor) {
+            LOGE("tjInitDecompress failed");
             return;
         }
-        listener = ctx->frameListenerGlobalRef;
-        ctx->frameLogCounter++;
-        if ((ctx->frameLogCounter % 30u) == 0u) {
-            LOGD(
-                    "MJPEG frame callback: format=%u width=%u height=%u bytes=%zu seq=%u",
-                    frame->frame_format,
-                    frame->width,
-                    frame->height,
-                    frame->data_bytes,
-                    frame->sequence
-            );
+    }
+
+    // Read JPEG dimensions from frame header
+    int jpegWidth = 0, jpegHeight = 0, jpegSubsamp = 0, jpegColorspace = 0;
+    if (tjDecompressHeader3(
+            ctx->tjDecompressor,
+            reinterpret_cast<const unsigned char*>(frame->data),
+            static_cast<unsigned long>(frame->data_bytes),
+            &jpegWidth, &jpegHeight, &jpegSubsamp, &jpegColorspace) != 0) {
+        LOGE("tjDecompressHeader3 failed: %s", tjGetErrorStr2(ctx->tjDecompressor));
+        return;
+    }
+
+    // Decode directly into ANativeWindow if available
+    ANativeWindow* win = ctx->window;
+    if (win) {
+        if (jpegWidth != ctx->lastWindowWidth || jpegHeight != ctx->lastWindowHeight) {
+            ANativeWindow_setBuffersGeometry(win, jpegWidth, jpegHeight, WINDOW_FORMAT_RGBX_8888);
+            ctx->lastWindowWidth = jpegWidth;
+            ctx->lastWindowHeight = jpegHeight;
+        }
+
+        ANativeWindow_Buffer buf{};
+        if (ANativeWindow_lock(win, &buf, nullptr) == 0) {
+            if (buf.format == WINDOW_FORMAT_RGBX_8888) {
+                int stride = buf.stride * 4;
+                int ret = tjDecompress2(
+                        ctx->tjDecompressor,
+                        reinterpret_cast<const unsigned char*>(frame->data),
+                        static_cast<unsigned long>(frame->data_bytes),
+                        reinterpret_cast<unsigned char*>(buf.bits),
+                        jpegWidth,
+                        stride,
+                        jpegHeight,
+                        TJPF_RGBX,
+                        TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE
+                );
+                if (ret != 0) {
+                    LOGE("tjDecompress2 failed: %s", tjGetErrorStr2(ctx->tjDecompressor));
+                }
+            } else {
+                LOGE("Unexpected ANativeWindow_Buffer format: %d", buf.format);
+            }
+            ANativeWindow_unlockAndPost(win);
+        } else {
+            LOGE("ANativeWindow_lock failed");
         }
     }
 
-    jclass listenerClass = env->GetObjectClass(listener);
-    if (!listenerClass) {
-        if (didAttach) gJvm->DetachCurrentThread();
-        return;
-    }
+    // Deliver raw JPEG bytes to Java only when requested (e.g. photo capture)
+    if (ctx->deliverFramesToJava && ctx->frameListenerGlobalRef) {
+        JNIEnv* env = nullptr;
+        bool didAttach = false;
+        if (!getEnvForCallback(&env, &didAttach)) {
+            LOGE("Failed to get JNIEnv in frame callback");
+            return;
+        }
 
-    jmethodID onFrameMethod = env->GetMethodID(listenerClass, "onMjpegFrame", "([BII)V");
-    if (!onFrameMethod) {
-        env->DeleteLocalRef(listenerClass);
-        if (didAttach) gJvm->DetachCurrentThread();
-        return;
-    }
+        jobject listener = ctx->frameListenerGlobalRef;
 
-    jbyteArray jpegBytes = env->NewByteArray(static_cast<jsize>(frame->data_bytes));
-    if (!jpegBytes) {
-        env->DeleteLocalRef(listenerClass);
-        if (didAttach) gJvm->DetachCurrentThread();
-        return;
-    }
+        jclass listenerClass = env->GetObjectClass(listener);
+        if (listenerClass) {
+            jmethodID onFrameMethod = env->GetMethodID(listenerClass, "onMjpegFrame", "([BII)V");
+            if (onFrameMethod) {
+                jbyteArray jpegBytes = env->NewByteArray(static_cast<jsize>(frame->data_bytes));
+                if (jpegBytes) {
+                    env->SetByteArrayRegion(
+                            jpegBytes,
+                            0,
+                            static_cast<jsize>(frame->data_bytes),
+                            reinterpret_cast<const jbyte*>(frame->data)
+                    );
+                    env->CallVoidMethod(listener, onFrameMethod, jpegBytes,
+                            static_cast<jint>(frame->width), static_cast<jint>(frame->height));
+                    env->DeleteLocalRef(jpegBytes);
+                }
+            }
+            env->DeleteLocalRef(listenerClass);
+        }
 
-    env->SetByteArrayRegion(
-            jpegBytes,
-            0,
-            static_cast<jsize>(frame->data_bytes),
-            reinterpret_cast<const jbyte*>(frame->data)
-    );
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            LOGE("Exception while delivering MJPEG frame to Java");
+        }
 
-    env->CallVoidMethod(listener, onFrameMethod, jpegBytes, static_cast<jint>(frame->width), static_cast<jint>(frame->height));
-
-    env->DeleteLocalRef(jpegBytes);
-    env->DeleteLocalRef(listenerClass);
-
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        LOGE("Exception while delivering MJPEG frame to Java");
-    }
-
-    if (didAttach) {
-        gJvm->DetachCurrentThread();
+        if (didAttach) {
+            gJvm->DetachCurrentThread();
+        }
     }
 }
 
@@ -202,7 +254,7 @@ jint JNI_OnLoad(JavaVM* vm, void* /* reserved */) {
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_example_uvcshoot_NativeBridge_getNativeVersion(JNIEnv* env, jobject /* this */) {
-    std::string value = "uvcshoot-native-v10";
+    std::string value = "uvcshoot-native-v11-turbo";
     return env->NewStringUTF(value.c_str());
 }
 
@@ -230,6 +282,11 @@ Java_com_example_uvcshoot_NativeBridge_nativeRelease(
         clearFrameListenerLocked(env, ctx);
         releaseUvcLocked(ctx);
         closeOwnedUsbFdLocked(ctx);
+
+        if (ctx->tjDecompressor) {
+            tjDestroy(ctx->tjDecompressor);
+            ctx->tjDecompressor = nullptr;
+        }
 
         if (ctx->window) {
             ANativeWindow_release(ctx->window);
@@ -259,6 +316,8 @@ Java_com_example_uvcshoot_NativeBridge_nativeSetSurface(
     if (ctx->window) {
         ANativeWindow_release(ctx->window);
         ctx->window = nullptr;
+        ctx->lastWindowWidth = 0;
+        ctx->lastWindowHeight = 0;
         LOGD("Previous surface released");
     }
 
@@ -570,4 +629,20 @@ Java_com_example_uvcshoot_NativeBridge_nativeCloseUsbCamera(
     ctx->cameraOpened = false;
 
     LOGD("nativeCloseUsbCamera");
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_example_uvcshoot_NativeBridge_nativeSetDeliverFramesToJava(
+        JNIEnv* /* env */,
+        jobject /* this */,
+        jlong handle,
+        jboolean enable
+) {
+    auto* ctx = reinterpret_cast<NativeContext*>(handle);
+    if (!ctx) return;
+
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    ctx->deliverFramesToJava = (enable == JNI_TRUE);
+    LOGD("deliverFramesToJava set to %d", ctx->deliverFramesToJava ? 1 : 0);
 }
