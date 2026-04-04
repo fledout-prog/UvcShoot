@@ -47,9 +47,6 @@ class CameraService : Service() {
     // -----------------------------------------------------------------------
     private lateinit var uvcController: UvcController
 
-    /** Guards against calling startForeground() more than once. */
-    // private var isForeground = false  // unused while promoteToForeground() is a no-op
-
     // -----------------------------------------------------------------------
 
     override fun onCreate() {
