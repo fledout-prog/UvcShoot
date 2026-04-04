@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">UvcShoot</string>
+    <string name="notification_channel_name">Camera pipeline</string>
+    <string name="notification_channel_desc">Keeps the USB/UVC camera pipeline running in the background</string>
+    <string name="notification_title">UvcShoot</string>
+    <string name="notification_text">Camera pipeline active</string>
 </resources>
