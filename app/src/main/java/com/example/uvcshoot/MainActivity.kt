@@ -105,10 +105,11 @@ class MainActivity : AppCompatActivity() {
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             Log.d(TAG, "surfaceDestroyed — serviceBound=$serviceBound")
-            // Stop the MJPEG stream and detach the surface.  The camera
-            // session is fully closed by CameraService.onUnbind() when the
-            // Activity unbinds, so we only need a lightweight stream stop here.
-            cameraService?.stopPreviewPipeline()
+            // Surface is truly gone: clear the surface reference in the controller
+            // (so it is not accidentally reattached to the dead native window) and
+            // stop the MJPEG stream.  The camera session is fully closed by
+            // CameraService.onUnbind() when the Activity unbinds.
+            cameraService?.onSurfaceDestroyed()
         }
     }
 

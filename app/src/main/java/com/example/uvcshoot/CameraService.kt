@@ -162,6 +162,21 @@ class CameraService : Service() {
     }
 
     /**
+     * Called when the Activity's SurfaceView surface is truly destroyed
+     * ([android.view.SurfaceHolder.Callback.surfaceDestroyed]).  Clears the
+     * surface reference in the controller so it is not accidentally reattached
+     * to a dead native window, then stops the MJPEG stream.
+     *
+     * This is distinct from [stopPreviewPipeline], which pauses the stream but
+     * deliberately preserves the surface reference so it can be reattached after
+     * hard recovery.  Use this method only when the surface object is gone.
+     */
+    fun onSurfaceDestroyed() {
+        Log.d(TAG, "onSurfaceDestroyed")
+        uvcController.onSurfaceDestroyed()
+    }
+
+    /**
      * Detach the current preview Surface and stop the active MJPEG stream.
      * Delegates to [stopPreviewPipeline]; kept for API compatibility.
      * The camera pipeline (USB connection + UVC context) remains open.

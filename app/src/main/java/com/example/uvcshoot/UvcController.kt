@@ -65,6 +65,28 @@ class UvcController(
     private var surfaceReady = false  // true while a valid Surface is attached
     @Volatile private var streaming = false  // true while nativeStartMjpegStream is active
 
+    /**
+     * Last valid Surface provided by the Activity.  Persists across hard-recovery
+     * cycles so it can be reattached after the camera reopens.  Only cleared when
+     * the surface is truly destroyed ([onSurfaceDestroyed]).
+     *
+     * Marked `@Volatile` so reads in non-synchronized methods (e.g. [attachSurface],
+     * [openUsbConnectionAndSendToNative]) always see the most recent write.
+     */
+    @Volatile private var currentSurface: Surface? = null
+
+    /**
+     * Guard against back-to-back [hardRecoverCameraSession] calls.  Set at the
+     * start of recovery and cleared when the synchronous portion completes.
+     * Prevents duplicate teardown+reopen sequences triggered by rapid lifecycle
+     * callbacks (onResume + surfaceCreated + onServiceConnected).
+     *
+     * Marked `@Volatile` for cross-thread visibility (consistent with [streaming]).
+     * Write-then-check atomicity within [hardRecoverCameraSession] is ensured by
+     * its [@Synchronized] annotation.
+     */
+    @Volatile private var isRecovering = false
+
     /** Returns true while the MJPEG stream is running. */
     fun isStreaming(): Boolean = streaming
 
@@ -111,6 +133,15 @@ class UvcController(
                     }
                     if (granted) {
                         Log.d("UVC", "USB permission GRANTED for ${device.deviceName}")
+                        // Guard: if the camera was already opened (e.g. by a concurrent recovery
+                        // path), do not re-open on top of a healthy session.
+                        if (cameraReady) {
+                            Log.d(
+                                "UVC",
+                                "USB permission granted but cameraReady=true — skipping duplicate open for ${device.deviceName}"
+                            )
+                            return
+                        }
                         pendingCamera = device
                         openUsbConnectionAndSendToNative(device)
                     } else {
@@ -174,6 +205,7 @@ class UvcController(
      * recovery use [hardRecoverCameraSession] instead.
      */
     fun attachSurface(surface: Surface) {
+        currentSurface = surface
         Log.d(
             "UVC",
             "attachSurface: cameraReady=$cameraReady streaming=$streaming " +
@@ -187,6 +219,26 @@ class UvcController(
         } else {
             Log.w("UVC", "attachSurface: native handle not ready — stream deferred until camera opens")
         }
+    }
+
+    /**
+     * Called when the [android.view.SurfaceHolder] reports that the surface has
+     * been truly destroyed (via [android.view.SurfaceHolder.Callback.surfaceDestroyed]).
+     *
+     * Unlike [stopPreviewPipeline] (which only pauses the stream but keeps
+     * [currentSurface] so it can be reattached after recovery), this method also
+     * clears [currentSurface] because the surface object is no longer valid.
+     * Do NOT call this from [closeCameraSession] / hard recovery — the surface
+     * may still be alive and should survive the pipeline teardown.
+     */
+    fun onSurfaceDestroyed() {
+        Log.d(
+            "UVC",
+            "onSurfaceDestroyed: surface truly destroyed — clearing currentSurface and stopping stream " +
+                "(cameraReady=$cameraReady streaming=$streaming)"
+        )
+        currentSurface = null
+        stopPreviewPipeline()
     }
 
     /**
@@ -269,49 +321,98 @@ class UvcController(
      *                If `null`, call [attachSurface] separately when the surface
      *                becomes available.
      */
+    @Synchronized
     fun hardRecoverCameraSession(surface: Surface? = null) {
+        // Always update currentSurface when a new valid surface is provided.
+        // This must happen BEFORE the isRecovering guard so that even a skipped
+        // recovery benefits from the freshest surface when it completes.
+        if (surface != null) {
+            Log.d("UVC", "hardRecoverCameraSession: updating currentSurface from caller")
+            currentSurface = surface
+        }
+
+        // Serialize: if a recovery is already running, the surface update above
+        // is sufficient — the in-progress recovery will use it.
+        if (isRecovering) {
+            Log.d(
+                "UVC",
+                "hardRecoverCameraSession: recovery already in progress — surface updated, skipping duplicate " +
+                    "(currentSurface=${currentSurface != null})"
+            )
+            return
+        }
+
+        isRecovering = true
         Log.d(
             "UVC",
-            "hardRecoverCameraSession: begin — surface=${surface != null} " +
-                "cameraReady=$cameraReady streaming=$streaming"
+            "hardRecoverCameraSession: begin — currentSurface=${currentSurface != null} " +
+                "cameraReady=$cameraReady streaming=$streaming surfaceReady=$surfaceReady"
         )
+
+        // Hard teardown.  Note: closeCameraSession does NOT clear currentSurface,
+        // so the surface reference survives this teardown.
         closeCameraSession()
 
         val device = pendingCamera ?: findUvcDevice()
         if (device == null) {
             Log.w("UVC", "hardRecoverCameraSession: no USB device found — recovery deferred until device attach")
-            // Pre-attach surface so the stream starts as soon as the camera
-            // opens via the USB-attach broadcast path.
-            if (surface != null && nativeHandle != 0L) {
-                NativeBridge.nativeSetSurface(nativeHandle, surface)
+            // Pre-attach current surface so the stream fires as soon as a device is
+            // seen via the USB-attach broadcast path.
+            val cs = currentSurface
+            if (cs != null && nativeHandle != 0L) {
+                NativeBridge.nativeSetSurface(nativeHandle, cs)
                 surfaceReady = true
                 Log.d("UVC", "hardRecoverCameraSession: surface pre-attached (waiting for USB device)")
+            } else {
+                Log.d(
+                    "UVC",
+                    "hardRecoverCameraSession: no surface to pre-attach " +
+                        "(currentSurface=${currentSurface != null} nativeHandle=$nativeHandle)"
+                )
             }
+            isRecovering = false
             return
         }
 
         if (usbManager.hasPermission(device)) {
-            Log.d("UVC", "hardRecoverCameraSession: reopening from clean state — device=${device.deviceName}")
+            Log.d(
+                "UVC",
+                "hardRecoverCameraSession: USB permission OK — reopening from clean state, " +
+                    "device=${device.deviceName} currentSurface=${currentSurface != null}"
+            )
             pendingCamera = device
+            // openUsbConnectionAndSendToNative will reattach currentSurface and start the
+            // stream internally once the camera is ready (see post-open step inside that method).
             openUsbConnectionAndSendToNative(device)
-            // Attach the surface after the camera open attempt so that
-            // nativeSetSurface is only called once the UVC device state is
-            // established, then trigger the stream start.
-            if (surface != null) {
-                attachSurface(surface)
-            }
         } else {
-            Log.d("UVC", "hardRecoverCameraSession: USB device found but no permission — re-requesting")
-            // Pre-attach surface so the stream starts automatically once
-            // permission is granted and openUsbConnectionAndSendToNative fires.
-            if (surface != null && nativeHandle != 0L) {
-                NativeBridge.nativeSetSurface(nativeHandle, surface)
+            Log.d(
+                "UVC",
+                "hardRecoverCameraSession: no USB permission — requesting, pre-attaching surface " +
+                    "(currentSurface=${currentSurface != null})"
+            )
+            // Pre-attach so the stream starts automatically once permission is granted
+            // and openUsbConnectionAndSendToNative fires from the broadcast receiver.
+            val cs = currentSurface
+            if (cs != null && nativeHandle != 0L) {
+                NativeBridge.nativeSetSurface(nativeHandle, cs)
                 surfaceReady = true
                 Log.d("UVC", "hardRecoverCameraSession: surface pre-attached (waiting for USB permission)")
+            } else {
+                Log.d(
+                    "UVC",
+                    "hardRecoverCameraSession: no surface to pre-attach for permission wait " +
+                        "(currentSurface=${currentSurface != null})"
+                )
             }
             usbPermissionHelper.requestPermission(usbManager, device)
         }
-        Log.d("UVC", "hardRecoverCameraSession: complete — cameraReady=$cameraReady streaming=$streaming")
+
+        isRecovering = false
+        Log.d(
+            "UVC",
+            "hardRecoverCameraSession: end — cameraReady=$cameraReady streaming=$streaming " +
+                "surfaceReady=$surfaceReady currentSurface=${currentSurface != null}"
+        )
     }
 
     /**
@@ -459,7 +560,44 @@ class UvcController(
         if (!probeOk) return
 
         cameraReady = true
-        Log.d("UVC", "cameraReady=true surfaceReady=$surfaceReady → tryStartStream")
+        Log.d(
+            "UVC",
+            "openUsbConnectionAndSendToNative: USB open success — cameraReady=true " +
+                "surfaceReady=$surfaceReady currentSurface=${currentSurface != null}"
+        )
+
+        // --- Explicit post-open step ---
+        // closeCameraSession() (called by hard recovery) detaches the surface from native
+        // (nativeSetSurface(null) + surfaceReady=false) but deliberately preserves
+        // currentSurface so it can be reattached here.  This ensures that after every
+        // successful camera open we deterministically reattach the surface and attempt
+        // to start the stream — exactly once.
+        if (!surfaceReady) {
+            val cs = currentSurface
+            if (cs != null && nativeHandle != 0L) {
+                NativeBridge.nativeSetSurface(nativeHandle, cs)
+                surfaceReady = true
+                Log.d(
+                    "UVC",
+                    "openUsbConnectionAndSendToNative: currentSurface reattached after open — " +
+                        "surfaceReady=true, calling tryStartStream"
+                )
+            } else {
+                Log.d(
+                    "UVC",
+                    "openUsbConnectionAndSendToNative: no surface available — " +
+                        "stream start deferred until attachSurface is called " +
+                        "(currentSurface=${currentSurface != null})"
+                )
+            }
+        } else {
+            Log.d(
+                "UVC",
+                "openUsbConnectionAndSendToNative: surfaceReady already true (surface was pre-attached) — " +
+                    "calling tryStartStream"
+            )
+        }
+
         tryStartStream()
     }
 
