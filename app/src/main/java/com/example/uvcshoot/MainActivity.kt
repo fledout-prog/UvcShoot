@@ -21,8 +21,12 @@ import androidx.appcompat.app.AppCompatActivity
  * Lifecycle contract:
  *  - onStart  → bind to [CameraService] (service is NOT started here;
  *               it promotes itself to foreground once a USB device is engaged)
- *  - onStop   → unbind (service continues in background if already foreground)
- *  - SurfaceHolder.Callback → attach/detach preview surface via service API
+ *  - onStop   → stop preview pipeline + unbind (service closes camera session
+ *               via onUnbind, ensuring a clean state on next bind)
+ *  - SurfaceHolder.Callback → hard-recover on surfaceCreated (the definitive
+ *    recovery point after any standby/background cycle); attachSurface on
+ *    surfaceChanged (dimension update only); stopPreviewPipeline on
+ *    surfaceDestroyed.
  *  - onKeyDown (volume-down / KEYCODE_CAMERA) → trigger capture
  */
 class MainActivity : AppCompatActivity() {
@@ -49,11 +53,13 @@ class MainActivity : AppCompatActivity() {
             serviceBound = true
 
             // If the SurfaceView already has a valid surface (e.g., quick
-            // resume), attach it immediately so preview starts right away.
+            // resume where surfaceCreated was not re-fired), kick off a hard
+            // recovery so the pipeline opens from a known-clean state rather
+            // than assuming any prior state is still healthy.
             val holder = previewSurface.holder
             if (holder.surface != null && holder.surface.isValid) {
-                Log.d(TAG, "onServiceConnected: surface already valid — attaching")
-                cameraService?.attachSurface(holder.surface)
+                Log.d(TAG, "onServiceConnected: surface already valid — triggering hard recovery")
+                cameraService?.hardRecoverCameraSession(holder.surface)
             }
             updateStatus("Camera service connected")
         }
@@ -77,7 +83,13 @@ class MainActivity : AppCompatActivity() {
                 "surfaceCreated — serviceBound=$serviceBound " +
                     "streaming=${cameraService?.isStreaming()}"
             )
-            cameraService?.attachSurface(holder.surface)
+            // Hard recovery: always tear down and reopen from clean state when
+            // a new surface is created.  This is the primary recovery point
+            // after standby, lock/unlock, or any background cycle.  It prevents
+            // the pipeline from reopening on top of stale native/USB state —
+            // which was the root cause of corrupted frames (bands/lines) and
+            // black-screen resume.
+            cameraService?.hardRecoverCameraSession(holder.surface)
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -86,13 +98,17 @@ class MainActivity : AppCompatActivity() {
                 "surfaceChanged ${width}x${height} — serviceBound=$serviceBound " +
                     "streaming=${cameraService?.isStreaming()}"
             )
-            // Re-attach so the native window is refreshed with the new dimensions.
+            // Surface dimensions changed; refresh the native window handle
+            // without a full pipeline teardown.
             cameraService?.attachSurface(holder.surface)
         }
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             Log.d(TAG, "surfaceDestroyed — serviceBound=$serviceBound")
-            cameraService?.detachSurface()
+            // Stop the MJPEG stream and detach the surface.  The camera
+            // session is fully closed by CameraService.onUnbind() when the
+            // Activity unbinds, so we only need a lightweight stream stop here.
+            cameraService?.stopPreviewPipeline()
         }
     }
 
@@ -122,10 +138,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Deterministic recovery point: after returning from standby or
-        // background the surface may have been recreated and the stream may
-        // need a restart.  If the service is already bound and the surface is
-        // valid, ask the controller to recover.
+        // Hard recovery point: after returning from standby, background, or any
+        // pause/resume cycle that did not trigger onStop (and therefore did not
+        // rebind the service), ensure the pipeline is torn down and reopened
+        // from a clean state if the service is already bound and the surface is
+        // valid.  This covers the case where surfaceCreated is not re-fired
+        // (surface survived the pause) and onServiceConnected is not re-fired
+        // (service was already bound).
         val holder = previewSurface.holder
         val surfaceValid = holder.surface.isValid
         Log.d(
@@ -134,18 +153,22 @@ class MainActivity : AppCompatActivity() {
                 "streaming=${cameraService?.isStreaming()}"
         )
         if (serviceBound && surfaceValid) {
-            cameraService?.recoverPreviewIfNeeded()
+            Log.d(TAG, "onResume: service bound and surface valid — triggering hard recovery")
+            cameraService?.hardRecoverCameraSession(holder.surface)
         }
     }
 
     override fun onStop() {
         if (serviceBound) {
-            // Detach surface — service keeps the camera pipeline alive.
-            cameraService?.detachSurface()
+            // Stop the preview stream quickly before unbinding.  The service's
+            // onUnbind() will perform the full hard teardown (close native UVC
+            // session + USB connection) so the pipeline is in a clean state
+            // when the Activity rebinds.
+            cameraService?.stopPreviewPipeline()
             unbindService(serviceConnection)
             serviceBound = false
             cameraService = null
-            Log.d(TAG, "onStop: unbound from service — pipeline continues in background")
+            Log.d(TAG, "onStop: stream stopped, unbound from service — hard teardown in onUnbind")
         }
         super.onStop()
     }

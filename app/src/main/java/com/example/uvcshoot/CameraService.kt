@@ -19,10 +19,17 @@ import android.view.Surface
  *    The app therefore runs as a bound/local service until a safe, well-gated
  *    promotion path is implemented.
  *  - The Activity binds to this service to get a [LocalBinder] reference.
- *  - [attachSurface] / [detachSurface] are called by the Activity when its
- *    SurfaceView is created/destroyed.  On detach the MJPEG stream is stopped
- *    and restarted cleanly on the next [attachSurface]; the USB/UVC context
- *    stays open so there is no camera re-open overhead on resume.
+ *  - [attachSurface] / [stopPreviewPipeline] are called by the Activity when
+ *    its SurfaceView dimensions change or the window goes away.
+ *  - [hardRecoverCameraSession] is the definitive recovery entry point: it
+ *    tears down the entire pipeline (stop stream → close native UVC → close
+ *    USB) and then reopens from a known-clean state.  Called on surface
+ *    creation and on Activity resume to avoid reopening on top of stale
+ *    native/USB state (the root cause of corrupted frames and black-screen
+ *    resume).
+ *  - [closeCameraSession] is the matching hard-teardown called whenever the
+ *    Activity unbinds (goes to background), so the pipeline is always in a
+ *    clean state when the Activity reconnects.
  *  - Future capture/trigger commands are routed through [requestCapture].
  *  - Returns START_STICKY so the OS will restart the service after a
  *    resource reclaim, subject to Android background execution limits.
@@ -77,10 +84,13 @@ class CameraService : Service() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
-        Log.d(TAG, "onUnbind — Activity disconnected; service stays alive in background")
-        // Detach the preview surface so the native window reference is released,
-        // but leave the camera pipeline running for immediate capture readiness.
-        uvcController.detachSurface()
+        Log.d(TAG, "onUnbind — Activity disconnected; performing hard teardown of camera pipeline")
+        // Hard teardown: stop stream, close native UVC session, close USB
+        // connection.  On the next bind the Activity will call
+        // hardRecoverCameraSession() to reopen from a known-clean state,
+        // preventing stale native/USB state from causing corrupted frames or
+        // black-screen resume.
+        uvcController.closeCameraSession()
         // Return true so onRebind is called when the Activity reconnects.
         return true
     }
@@ -120,6 +130,38 @@ class CameraService : Service() {
     }
 
     /**
+     * Stop the MJPEG stream and detach the surface from the native layer.
+     * The USB/UVC pipeline stays open; call [attachSurface] to resume.
+     */
+    fun stopPreviewPipeline() {
+        Log.d(TAG, "stopPreviewPipeline")
+        uvcController.stopPreviewPipeline()
+    }
+
+    /**
+     * Hard teardown: stop stream, close native UVC camera session, close Java
+     * USB connection, and reset all state flags.  After this the pipeline is
+     * in a known-clean state suitable for [hardRecoverCameraSession].
+     */
+    fun closeCameraSession() {
+        Log.d(TAG, "closeCameraSession")
+        uvcController.closeCameraSession()
+    }
+
+    /**
+     * Definitive hard recovery: tear down the entire pipeline then reopen
+     * from the last known USB device.  Optionally pre-attaches [surface] so
+     * the stream starts as soon as the camera is ready.
+     *
+     * This replaces soft-retry / [recoverPreviewIfNeeded] as the primary
+     * recovery path on surface creation and Activity resume.
+     */
+    fun hardRecoverCameraSession(surface: Surface? = null) {
+        Log.d(TAG, "hardRecoverCameraSession — surface=${surface != null}")
+        uvcController.hardRecoverCameraSession(surface)
+    }
+
+    /**
      * Detach the current preview Surface and stop the active MJPEG stream.
      * The camera pipeline (USB connection + UVC context) remains open so the
      * next [attachSurface] call cleanly restarts the stream.
@@ -139,11 +181,9 @@ class CameraService : Service() {
     fun isStreaming(): Boolean = uvcController.isStreaming()
 
     /**
-     * Inspect and recover preview state after standby, screen-off, or any
-     * condition that may have disrupted the camera/stream/surface alignment.
-     *
-     * Delegates to [UvcController.recoverPreviewIfNeeded].  Safe to call from
-     * [MainActivity.onResume] or any other recovery trigger point.
+     * Lightweight soft-recovery path.  Prefer [hardRecoverCameraSession] when
+     * returning from background or after any standby cycle where the pipeline
+     * may be in a stale or corrupted state.
      */
     fun recoverPreviewIfNeeded() {
         Log.d(TAG, "recoverPreviewIfNeeded — delegating to controller")
