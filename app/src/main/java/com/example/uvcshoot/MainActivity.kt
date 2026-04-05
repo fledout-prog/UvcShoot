@@ -78,6 +78,7 @@ class MainActivity : AppCompatActivity() {
                     PreviewRecoveryDecision.STREAM_RESTART_ONLY -> {
                         Log.d(TAG, "UVC_HEALTH: SERVICE_BIND → STREAM_RESTART_ONLY")
                         cameraService?.attachSurface(surface)
+                        cameraService?.restartPreviewStreamOnly()
                     }
                     PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY -> {
                         Log.d(TAG, "UVC_HEALTH: SERVICE_BIND → SOFT_PREVIEW_RECOVERY")
@@ -130,6 +131,7 @@ class MainActivity : AppCompatActivity() {
                 PreviewRecoveryDecision.STREAM_RESTART_ONLY -> {
                     Log.d(TAG, "UVC_HEALTH: SURFACE_CREATE → STREAM_RESTART_ONLY")
                     cameraService?.attachSurface(surface)
+                    cameraService?.restartPreviewStreamOnly()
                 }
                 PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY -> {
                     Log.d(TAG, "UVC_HEALTH: SURFACE_CREATE → SOFT_PREVIEW_RECOVERY")
@@ -219,6 +221,7 @@ class MainActivity : AppCompatActivity() {
                 PreviewRecoveryDecision.STREAM_RESTART_ONLY -> {
                     Log.d(TAG, "UVC_HEALTH: ACT_RESUME → STREAM_RESTART_ONLY")
                     cameraService?.attachSurface(surface)
+                    cameraService?.restartPreviewStreamOnly()
                 }
                 PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY -> {
                     Log.d(TAG, "UVC_HEALTH: ACT_RESUME → SOFT_PREVIEW_RECOVERY")

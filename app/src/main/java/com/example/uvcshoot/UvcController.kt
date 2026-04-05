@@ -768,7 +768,7 @@ class UvcController(
      *  - stream running ([streamRunning])
      *  - native render path bound to current surface ([surfaceAttached])
      *  - surface generation consistent ([currentSurfaceGeneration] == [attachedSurfaceGeneration])
-     *  - a frame was confirmed recently by [FrameCallback] (within 1 500 ms)
+     *  - a frame was confirmed recently by [FrameCallback] (within 1500 ms)
      *
      * [now] defaults to the current elapsed-realtime clock and may be passed
      * explicitly in tests.
