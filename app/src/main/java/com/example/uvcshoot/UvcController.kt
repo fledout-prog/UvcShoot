@@ -62,7 +62,7 @@ class UvcController(
     private var nativeHandle: Long = 0L
 
     // --- Lifecycle state machine ---
-    // All four conditions must be simultaneously satisfied before the unified
+    // All five conditions must be simultaneously satisfied before the unified
     // readiness gate (tryStartPreview) will invoke nativeSetSurface +
     // nativeStartMjpegStream.
     private var usbPermissionGranted = false  // true once USB permission is known to be granted
@@ -178,7 +178,14 @@ class UvcController(
             return
         }
         if (streaming) {
-            Log.d("UVC", "tryStartPreview: duplicate start suppressed — already streaming")
+            // Already streaming: refresh the native surface handle in case the
+            // surface was recreated (e.g. surfaceChanged dimension update) without
+            // restarting the pipeline.
+            Log.d("UVC", "tryStartPreview: already streaming — refreshing surface reference only")
+            if (cs != null && cs.isValid && nativeHandle != 0L) {
+                NativeBridge.nativeSetSurface(nativeHandle, cs)
+                Log.d("UVC", "tryStartPreview: nativeSetSurface called (streaming refresh)")
+            }
             return
         }
         if (isStarting) {
@@ -289,30 +296,28 @@ class UvcController(
     }
 
     /**
-     * Attach a preview [Surface].  Updates [currentSurface], passes the surface to
-     * the native layer, and invokes the unified readiness gate ([tryStartPreview]).
+     * Attach a preview [Surface].  Updates [currentSurface] and invokes the
+     * unified readiness gate ([tryStartPreview]).
      *
-     * Use this for dimension changes ([surfaceChanged]) where the pipeline is already
-     * healthy and only the surface handle needs refreshing.  For post-standby or
-     * post-background recovery use [hardRecoverCameraSession] instead.
+     * [tryStartPreview] handles both cases:
+     *  - Stream not yet started: attaches surface and starts stream when all
+     *    prerequisites are met.
+     *  - Stream already active (e.g. [surfaceChanged] dimension update): refreshes
+     *    the native surface handle without restarting the pipeline.
+     *
+     * For post-standby or post-background recovery use [hardRecoverCameraSession]
+     * instead.
      */
     fun attachSurface(surface: Surface) {
         currentSurface = surface
+        surfaceReady = true
         Log.d(
             "UVC",
             "attachSurface: currentSurface updated — " +
                 "cameraOpened=$cameraOpened streaming=$streaming " +
-                "surfaceReady=$surfaceReady nativeHandle=$nativeHandle"
+                "surfaceReady=$surfaceReady nativeHandle=$nativeHandle " +
+                "— invoking tryStartPreview"
         )
-        // Always refresh the native window handle if the native layer is ready,
-        // even when streaming (covers surfaceChanged dimension updates).
-        if (nativeHandle != 0L) {
-            NativeBridge.nativeSetSurface(nativeHandle, surface)
-            surfaceReady = true
-            Log.d("UVC", "attachSurface: nativeSetSurface called — invoking tryStartPreview")
-        } else {
-            Log.w("UVC", "attachSurface: native handle not ready — invoking tryStartPreview to defer")
-        }
         tryStartPreview()
     }
 
@@ -425,6 +430,10 @@ class UvcController(
         }
 
         // 3. Close native UVC camera session if it was open.
+        //    `nativeHandle != 0L` is a defensive check: in the normal state machine
+        //    nativeHandle is always non-zero when cameraOpened is true (nativeInit()
+        //    in start() sets it before any open), but guarding here makes teardown
+        //    safe even if release() races a teardown.
         if (cameraOpened && nativeHandle != 0L) {
             Log.d("UVC", "closeCameraSession: invoking nativeCloseUsbCamera")
             NativeBridge.nativeCloseUsbCamera(nativeHandle)
