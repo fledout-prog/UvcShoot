@@ -163,8 +163,8 @@ class CameraService : Service() {
 
     /**
      * Detach the current preview Surface and stop the active MJPEG stream.
-     * The camera pipeline (USB connection + UVC context) remains open so the
-     * next [attachSurface] call cleanly restarts the stream.
+     * Delegates to [stopPreviewPipeline]; kept for API compatibility.
+     * The camera pipeline (USB connection + UVC context) remains open.
      */
     fun detachSurface() {
         Log.d(TAG, "detachSurface")

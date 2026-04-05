@@ -160,15 +160,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         if (serviceBound) {
-            // Stop the preview stream quickly before unbinding.  The service's
-            // onUnbind() will perform the full hard teardown (close native UVC
-            // session + USB connection) so the pipeline is in a clean state
+            // Unbind from the service.  CameraService.onUnbind() performs the
+            // full hard teardown (closeCameraSession: stop stream + close native
+            // UVC + close USB connection) so the pipeline is in a clean state
             // when the Activity rebinds.
-            cameraService?.stopPreviewPipeline()
             unbindService(serviceConnection)
             serviceBound = false
             cameraService = null
-            Log.d(TAG, "onStop: stream stopped, unbound from service — hard teardown in onUnbind")
+            Log.d(TAG, "onStop: unbound from service — full hard teardown via onUnbind")
         }
         super.onStop()
     }
