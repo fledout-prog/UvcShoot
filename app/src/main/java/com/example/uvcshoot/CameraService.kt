@@ -18,18 +18,22 @@ import android.view.Surface
  *    early throws a [SecurityException] on Android 14+ (targetSdk 36).
  *    The app therefore runs as a bound/local service until a safe, well-gated
  *    promotion path is implemented.
- *  - The Activity binds to this service to get a [LocalBinder] reference.
- *  - [attachSurface] / [stopPreviewPipeline] are called by the Activity when
- *    its SurfaceView dimensions change or the window goes away.
- *  - [hardRecoverCameraSession] is the definitive recovery entry point: it
- *    tears down the entire pipeline (stop stream → close native UVC → close
- *    USB) and then reopens from a known-clean state.  Called on surface
- *    creation and on Activity resume to avoid reopening on top of stale
- *    native/USB state (the root cause of corrupted frames and black-screen
- *    resume).
- *  - [closeCameraSession] is the matching hard-teardown called whenever the
- *    Activity unbinds (goes to background), so the pipeline is always in a
- *    clean state when the Activity reconnects.
+ *  - The Activity binds in its onCreate() and unbinds only in onDestroy(), so
+ *    the binding (and the camera session) survive HOME/temporary background
+ *    transitions.  [onUnbind] therefore signals true Activity destruction, not
+ *    a transient background event.
+ *  - [attachSurface] is the normal reattach path on resume: it updates the
+ *    native surface binding and lets [UvcController.tryStartPreview] decide
+ *    whether to (re)start the stream.
+ *  - [hardRecoverCameraSession] is the full recovery entry point for first
+ *    launch, USB detach/reattach, or unrecoverable native failure: it tears
+ *    down the entire pipeline and reopens from a known-clean state.
+ *  - [onSurfaceDestroyed] is called when the surface window is gone (e.g.
+ *    screen off or HOME); it stops the stream and clears the surface reference
+ *    without touching the camera session, so the camera stays ready for the
+ *    next [surfaceCreated] → [attachSurface] cycle.
+ *  - [closeCameraSession] is the hard teardown path, now called only from
+ *    [onUnbind] (Activity destruction) and from [hardRecoverCameraSession].
  *  - Future capture/trigger commands are routed through [requestCapture].
  *  - Returns START_STICKY so the OS will restart the service after a
  *    resource reclaim, subject to Android background execution limits.
@@ -58,11 +62,7 @@ class CameraService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "onCreate — initialising camera controller")
-        // Pass the callback so UvcController can notify us when a USB device is
-        // engaged.  promoteToForeground() is currently a no-op (see its KDoc),
-        // but the hook is kept so future implementations can re-enable FGS
-        // promotion without changing the controller code.
+        Log.d(TAG, "UVC_STATE: SERVICE_CREATE — initialising camera controller")
         uvcController = UvcController(applicationContext, onUsbDeviceEngaged = ::promoteToForeground)
         uvcController.start()
     }
@@ -74,29 +74,31 @@ class CameraService : Service() {
     }
 
     override fun onBind(intent: Intent): IBinder {
-        Log.d(TAG, "onBind — Activity connected")
+        Log.d(TAG, "UVC_STATE: SERVICE_ONBIND — Activity connected")
         return binder
     }
 
     override fun onRebind(intent: Intent?) {
-        Log.d(TAG, "onRebind — Activity reconnected")
+        Log.d(TAG, "UVC_STATE: SERVICE_ONREBIND — Activity reconnected")
         super.onRebind(intent)
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
-        Log.d(TAG, "onUnbind — Activity disconnected; performing hard teardown of camera pipeline")
-        // Hard teardown: stop stream, close native UVC session, close USB
-        // connection.  On the next bind the Activity will call
-        // hardRecoverCameraSession() to reopen from a known-clean state,
-        // preventing stale native/USB state from causing corrupted frames or
-        // black-screen resume.
+        // onUnbind is now called only when the Activity is truly destroyed
+        // (binding was moved to onCreate/onDestroy in MainActivity), not on
+        // every HOME/background transition.  Perform full teardown here since
+        // the session is no longer needed.
+        Log.d(
+            TAG,
+            "UVC_STATE: SERVICE_UNBIND — Activity destroyed; performing full camera session teardown"
+        )
         uvcController.closeCameraSession()
         // Return true so onRebind is called when the Activity reconnects.
         return true
     }
 
     override fun onDestroy() {
-        Log.d(TAG, "onDestroy")
+        Log.d(TAG, "UVC_STATE: SERVICE_DESTROY — releasing camera controller")
         uvcController.release()
         super.onDestroy()
     }
@@ -194,6 +196,9 @@ class CameraService : Service() {
 
     /** Returns true when the MJPEG stream is active and the camera is open. */
     fun isStreaming(): Boolean = uvcController.isStreaming()
+
+    /** Returns true when the UVC camera session is currently open. */
+    fun isCameraOpen(): Boolean = uvcController.isCameraOpen()
 
     /**
      * Lightweight soft-recovery path.  Prefer [hardRecoverCameraSession] when
