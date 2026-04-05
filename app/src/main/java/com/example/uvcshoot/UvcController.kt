@@ -27,7 +27,7 @@ import android.view.Surface
  *  - [hardRecoverCameraSession] is the definitive recovery entry point: it
  *    calls [closeCameraSession] and then reopens the USB/UVC pipeline from
  *    scratch.  Both the async USB-permission-granted path and the
- *    already-granted/resume path converge into [executePostOpenStartup],
+ *    already-granted/resume path converge into [tryStartPreview],
  *    which attempts to attach the current valid surface (if any) and starts
  *    the stream exactly once after a successful open.
  *  - [recoverPreviewIfNeeded] is a lightweight soft-recovery path kept for
@@ -62,10 +62,20 @@ class UvcController(
     private var nativeHandle: Long = 0L
 
     // --- Lifecycle state machine ---
-    // Both flags must be true before nativeStartMjpegStream is called.
-    private var cameraReady = false   // true after nativeProbeAndOpenUvc succeeds
-    private var surfaceReady = false  // true while a valid Surface is attached
-    @Volatile private var streaming = false  // true while nativeStartMjpegStream is active
+    // All four conditions must be simultaneously satisfied before the unified
+    // readiness gate (tryStartPreview) will invoke nativeSetSurface +
+    // nativeStartMjpegStream.
+    private var usbPermissionGranted = false  // true once USB permission is known to be granted
+    private var cameraOpened = false          // true after nativeProbeAndOpenUvc succeeds (was cameraReady)
+    private var surfaceReady = false          // true while a valid Surface is attached
+    @Volatile private var streaming = false   // true while nativeStartMjpegStream is active
+
+    /**
+     * Prevents duplicate nativeSetSurface + nativeStartMjpegStream invocations
+     * while a start sequence is in progress.  Cleared in the `finally` block of
+     * [tryStartPreview] so a failed start can be retried.
+     */
+    @Volatile private var isStarting = false
 
     /**
      * Last valid Surface provided by the Activity.  Persists across hard-recovery
@@ -106,30 +116,89 @@ class UvcController(
     fun isStreaming(): Boolean = streaming
 
     // -----------------------------------------------------------------------
-    // Gate: start stream only when both camera and surface are ready
+    // Unified readiness gate
     // -----------------------------------------------------------------------
 
-    private fun tryStartStream() {
-        when {
-            nativeHandle == 0L -> {
-                Log.d("UVC", "tryStartStream: skipped — native handle not initialized")
-                return
-            }
-            streaming -> {
-                Log.d("UVC", "tryStartStream: skipped — already streaming")
-                return
-            }
-            !cameraReady || !surfaceReady -> {
-                Log.d(
-                    "UVC",
-                    "tryStartStream: waiting — cameraReady=$cameraReady surfaceReady=$surfaceReady"
-                )
-                return
-            }
+    /**
+     * Single deterministic gate that decides when to attach the preview surface
+     * and start the MJPEG stream.
+     *
+     * Conditions required (ALL must be true simultaneously):
+     *  1. USB permission granted ([usbPermissionGranted])
+     *  2. Camera opened / native session ready ([cameraOpened] && [nativeHandle] ≠ 0)
+     *  3. A currently valid [Surface] is available ([currentSurface]?.isValid == true)
+     *  4. Not already streaming ([streaming] == false)
+     *  5. Not already starting ([isStarting] == false)
+     *
+     * Every missing condition is logged individually so a missing prerequisite is
+     * always visible in logcat.  Invoked from all paths that change one or more of
+     * these conditions.
+     */
+    @Synchronized
+    private fun tryStartPreview() {
+        val cs = currentSurface
+        val surfaceAvailable = cs != null && cs.isValid
+
+        Log.d(
+            "UVC",
+            "tryStartPreview [READINESS-GATE]: " +
+                "usbPermissionGranted=$usbPermissionGranted " +
+                "cameraOpened=$cameraOpened " +
+                "surfaceAvailable=$surfaceAvailable " +
+                "streaming=$streaming " +
+                "isStarting=$isStarting " +
+                "nativeHandle=$nativeHandle"
+        )
+
+        if (!usbPermissionGranted) {
+            Log.d("UVC", "tryStartPreview: NOT READY — prerequisite missing: usbPermissionGranted=false")
+            return
         }
-        val ok = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
-        streaming = ok
-        Log.d("UVC", "nativeStartMjpegStream result=$ok → streaming=$streaming")
+        if (!cameraOpened) {
+            Log.d("UVC", "tryStartPreview: NOT READY — prerequisite missing: cameraOpened=false")
+            return
+        }
+        if (nativeHandle == 0L) {
+            Log.d("UVC", "tryStartPreview: NOT READY — prerequisite missing: nativeHandle=0")
+            return
+        }
+        if (!surfaceAvailable) {
+            Log.d(
+                "UVC",
+                "tryStartPreview: NOT READY — prerequisite missing: surfaceAvailable=false " +
+                    "(currentSurface=${currentSurface != null} isValid=${cs?.isValid})"
+            )
+            // Clear a stale reference to a destroyed surface so it is not
+            // accidentally reused once the surface is recreated.
+            if (cs != null && !cs.isValid) {
+                Log.d("UVC", "tryStartPreview: clearing stale/invalid surface reference")
+                currentSurface = null
+                surfaceReady = false
+            }
+            return
+        }
+        if (streaming) {
+            Log.d("UVC", "tryStartPreview: duplicate start suppressed — already streaming")
+            return
+        }
+        if (isStarting) {
+            Log.d("UVC", "tryStartPreview: duplicate start suppressed — start already in progress")
+            return
+        }
+
+        // All prerequisites satisfied — start the preview pipeline exactly once.
+        isStarting = true
+        try {
+            Log.d("UVC", "tryStartPreview: all prerequisites satisfied — invoking nativeSetSurface")
+            NativeBridge.nativeSetSurface(nativeHandle, cs)
+            surfaceReady = true
+            Log.d("UVC", "tryStartPreview: invoking nativeStartMjpegStream")
+            val ok = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
+            streaming = ok
+            Log.d("UVC", "tryStartPreview: nativeStartMjpegStream result=$ok → streaming=$streaming")
+        } finally {
+            isStarting = false
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -148,16 +217,19 @@ class UvcController(
                     }
                     if (granted) {
                         Log.d("UVC", "USB permission GRANTED for ${device.deviceName} — ASYNC-PERMISSION PATH")
-                        // Guard: if the camera was already opened (cameraReady) or an open is
-                        // already in flight (isOpening), do not re-open on top of a healthy or
-                        // in-progress session.  This suppresses duplicate opens triggered by
-                        // multiple requestPermission calls fired within a single startup cycle.
-                        if (cameraReady || isOpening) {
+                        usbPermissionGranted = true
+                        // Guard: if the camera was already opened (cameraOpened) or an open is
+                        // already in flight (isOpening), the permission grant is a late/duplicate
+                        // broadcast.  The readiness gate (tryStartPreview) will handle starting
+                        // the stream once all other conditions are met.
+                        if (cameraOpened || isOpening) {
                             Log.d(
                                 "UVC",
-                                "ASYNC-PERMISSION PATH: duplicate open suppressed — " +
-                                    "cameraReady=$cameraReady isOpening=$isOpening for ${device.deviceName}"
+                                "ASYNC-PERMISSION PATH: camera already open or opening — " +
+                                    "duplicate open suppressed (cameraOpened=$cameraOpened isOpening=$isOpening); " +
+                                    "invoking tryStartPreview to ensure stream starts if ready"
                             )
+                            tryStartPreview()
                             return
                         }
                         pendingCamera = device
@@ -175,6 +247,7 @@ class UvcController(
                         // (requestPermission called) is being satisfied.
                         onUsbDeviceEngaged?.invoke()
                         if (usbManager.hasPermission(device)) {
+                            usbPermissionGranted = true
                             pendingCamera = device
                             openUsbConnectionAndSendToNative(device, entryPath = "usb-attach-already-granted")
                         } else {
@@ -216,27 +289,31 @@ class UvcController(
     }
 
     /**
-     * Attach a preview [Surface].  Sets [surfaceReady], passes the surface to
-     * the native layer, and calls [tryStartStream].  Use this for dimension
-     * changes ([surfaceChanged]) where the pipeline is already healthy and only
-     * the surface handle needs refreshing.  For post-standby or post-background
-     * recovery use [hardRecoverCameraSession] instead.
+     * Attach a preview [Surface].  Updates [currentSurface], passes the surface to
+     * the native layer, and invokes the unified readiness gate ([tryStartPreview]).
+     *
+     * Use this for dimension changes ([surfaceChanged]) where the pipeline is already
+     * healthy and only the surface handle needs refreshing.  For post-standby or
+     * post-background recovery use [hardRecoverCameraSession] instead.
      */
     fun attachSurface(surface: Surface) {
         currentSurface = surface
         Log.d(
             "UVC",
-            "attachSurface: cameraReady=$cameraReady streaming=$streaming " +
+            "attachSurface: currentSurface updated — " +
+                "cameraOpened=$cameraOpened streaming=$streaming " +
                 "surfaceReady=$surfaceReady nativeHandle=$nativeHandle"
         )
-        surfaceReady = true
+        // Always refresh the native window handle if the native layer is ready,
+        // even when streaming (covers surfaceChanged dimension updates).
         if (nativeHandle != 0L) {
             NativeBridge.nativeSetSurface(nativeHandle, surface)
-            Log.d("UVC", "attachSurface: surface attached to native — calling tryStartStream")
-            tryStartStream()
+            surfaceReady = true
+            Log.d("UVC", "attachSurface: nativeSetSurface called — invoking tryStartPreview")
         } else {
-            Log.w("UVC", "attachSurface: native handle not ready — stream deferred until camera opens")
+            Log.w("UVC", "attachSurface: native handle not ready — invoking tryStartPreview to defer")
         }
+        tryStartPreview()
     }
 
     /**
@@ -253,9 +330,10 @@ class UvcController(
         Log.d(
             "UVC",
             "onSurfaceDestroyed: surface truly destroyed — clearing currentSurface and stopping stream " +
-                "(cameraReady=$cameraReady streaming=$streaming)"
+                "(cameraOpened=$cameraOpened streaming=$streaming)"
         )
         currentSurface = null
+        surfaceReady = false
         stopPreviewPipeline()
     }
 
@@ -264,14 +342,14 @@ class UvcController(
      *
      * Stopping the stream explicitly (rather than silently dropping frames)
      * ensures [streaming] is `false` when the surface comes back, so
-     * [attachSurface] → [tryStartStream] performs a clean restart.
+     * [attachSurface] → [tryStartPreview] performs a clean restart.
      * The camera pipeline (USB connection + UVC context) remains open for
      * immediate capture readiness — only the render stream is paused.
      */
     fun detachSurface() {
         Log.d(
             "UVC",
-            "detachSurface: streaming=$streaming cameraReady=$cameraReady — stopping stream, camera stays open"
+            "detachSurface: streaming=$streaming cameraOpened=$cameraOpened — stopping stream, camera stays open"
         )
         stopPreviewPipeline()
     }
@@ -286,11 +364,12 @@ class UvcController(
     fun stopPreviewPipeline() {
         Log.d(
             "UVC",
-            "stopPreviewPipeline: streaming=$streaming cameraReady=$cameraReady — stopping stream, surface detached"
+            "stopPreviewPipeline: streaming=$streaming cameraOpened=$cameraOpened — stopping stream, surface detached"
         )
         surfaceReady = false
         if (nativeHandle != 0L) {
             if (streaming) {
+                Log.d("UVC", "stopPreviewPipeline: invoking nativeStopStream")
                 NativeBridge.nativeStopStream(nativeHandle)
                 streaming = false
                 Log.d("UVC", "stopPreviewPipeline: nativeStopStream called")
@@ -304,28 +383,66 @@ class UvcController(
      * Hard teardown: stop the MJPEG stream, close the native UVC camera
      * session, and close the Java USB connection.
      *
-     * After this call all state flags are reset and the controller is in a
-     * known-clean state suitable for a fresh [openUsbConnectionAndSendToNative]
-     * or [hardRecoverCameraSession] call.  The native handle itself is
-     * retained so [start] does not need to be called again.
+     * Symmetric teardown order:
+     *  1. Reset open/start guards so a fresh cycle is possible after this.
+     *  2. [nativeStopStream] if stream is active.
+     *  3. Detach surface from native ([nativeSetSurface] null).
+     *  4. [nativeCloseUsbCamera] if camera was open.
+     *  5. Close Java USB connection.
+     *  6. Reset all state flags including [usbPermissionGranted] so the next
+     *     cycle re-verifies permission before opening.
+     *
+     * After this call the controller is in a known-clean state suitable for a
+     * fresh [openUsbConnectionAndSendToNative] or [hardRecoverCameraSession] call.
+     * The native handle itself is retained so [start] does not need to be called again.
      */
     fun closeCameraSession() {
         Log.d(
             "UVC",
-            "closeCameraSession: hard teardown begin — streaming=$streaming " +
-                "cameraReady=$cameraReady nativeHandle=$nativeHandle"
+            "closeCameraSession: TEARDOWN BEGIN — streaming=$streaming " +
+                "cameraOpened=$cameraOpened nativeHandle=$nativeHandle"
         )
-        // Reset open guard so a fresh openUsbConnectionAndSendToNative is
-        // allowed after this teardown without hitting the duplicate-open guard.
+        // Reset open/start guards first so a fresh open is always allowed after teardown.
         isOpening = false
-        stopPreviewPipeline()
+        isStarting = false
+
+        // 1. Stop stream if active.
+        if (streaming) {
+            if (nativeHandle != 0L) {
+                Log.d("UVC", "closeCameraSession: invoking nativeStopStream")
+                NativeBridge.nativeStopStream(nativeHandle)
+            }
+            streaming = false
+            Log.d("UVC", "closeCameraSession: stream stopped")
+        }
+
+        // 2. Detach surface from native (does not clear currentSurface so the
+        //    Java Surface reference survives and can be reattached after recovery).
+        surfaceReady = false
         if (nativeHandle != 0L) {
+            NativeBridge.nativeSetSurface(nativeHandle, null)
+            Log.d("UVC", "closeCameraSession: surface detached from native")
+        }
+
+        // 3. Close native UVC camera session if it was open.
+        if (cameraOpened && nativeHandle != 0L) {
+            Log.d("UVC", "closeCameraSession: invoking nativeCloseUsbCamera")
             NativeBridge.nativeCloseUsbCamera(nativeHandle)
             Log.d("UVC", "closeCameraSession: nativeCloseUsbCamera called")
         }
+        cameraOpened = false
+
+        // 4. Close Java USB connection.
         closeUsbConnection()
-        cameraReady = false
-        Log.d("UVC", "closeCameraSession: hard teardown complete — cameraReady=false streaming=false surfaceReady=false")
+
+        // 5. Reset permission flag so the next cycle re-verifies permission.
+        usbPermissionGranted = false
+
+        Log.d(
+            "UVC",
+            "closeCameraSession: TEARDOWN COMPLETE — " +
+                "cameraOpened=false streaming=false surfaceReady=false usbPermissionGranted=false"
+        )
     }
 
     /**
@@ -367,14 +484,14 @@ class UvcController(
         // call from rapid lifecycle events (onResume + surfaceCreated + onServiceConnected
         // all firing within the same startup cycle).  Refresh the surface reference
         // without tearing down the healthy pipeline, and log the suppression.
-        if (cameraReady && streaming) {
+        if (cameraOpened && streaming) {
             Log.d(
                 "UVC",
                 "hardRecoverCameraSession: DUPLICATE OPEN SUPPRESSED — camera already open and streaming; " +
-                    "refreshing surface only (cameraReady=$cameraReady streaming=$streaming)"
+                    "refreshing surface only (cameraOpened=$cameraOpened streaming=$streaming)"
             )
             val cs = currentSurface
-            if (cs != null && nativeHandle != 0L) {
+            if (cs != null && cs.isValid && nativeHandle != 0L) {
                 NativeBridge.nativeSetSurface(nativeHandle, cs)
                 Log.d("UVC", "hardRecoverCameraSession: surface refreshed on live session")
             }
@@ -385,7 +502,7 @@ class UvcController(
         Log.d(
             "UVC",
             "hardRecoverCameraSession: begin — currentSurface=${currentSurface != null} " +
-                "cameraReady=$cameraReady streaming=$streaming surfaceReady=$surfaceReady"
+                "cameraOpened=$cameraOpened streaming=$streaming surfaceReady=$surfaceReady"
         )
 
         // Hard teardown.  Note: closeCameraSession does NOT clear currentSurface,
@@ -395,8 +512,6 @@ class UvcController(
         val device = pendingCamera ?: findUvcDevice()
         if (device == null) {
             Log.w("UVC", "hardRecoverCameraSession: no USB device found — recovery deferred until device attach")
-            // currentSurface is preserved; nativeSetSurface will be called in
-            // executePostOpenStartup() once a device is attached and opened.
             Log.d(
                 "UVC",
                 "hardRecoverCameraSession: waiting for USB device — " +
@@ -407,33 +522,32 @@ class UvcController(
         }
 
         if (usbManager.hasPermission(device)) {
+            usbPermissionGranted = true
             Log.d(
                 "UVC",
                 "hardRecoverCameraSession: USB permission OK — ALREADY-GRANTED PATH — reopening from clean state, " +
-                    "device=${device.deviceName} currentSurface=${currentSurface != null}"
+                    "device=${device.deviceName} currentSurface=${currentSurface != null} usbPermissionGranted=true"
             )
             pendingCamera = device
-            // openUsbConnectionAndSendToNative will call executePostOpenStartup() internally
-            // once the camera is ready, attaching currentSurface and starting the stream.
+            // openUsbConnectionAndSendToNative will set cameraOpened=true and call
+            // tryStartPreview() once the camera is ready, attaching currentSurface and
+            // starting the stream if all prerequisites are met.
             openUsbConnectionAndSendToNative(device, entryPath = "already-granted")
         } else {
             Log.d(
                 "UVC",
                 "hardRecoverCameraSession: no USB permission — requesting permission for device=${device.deviceName}; " +
-                    "currentSurface=${currentSurface != null} will be used in executePostOpenStartup() after open"
+                    "currentSurface=${currentSurface != null} will be used in tryStartPreview() after open"
             )
-            // Do NOT pre-attach the surface to native here: the camera is not yet open,
-            // and nativeSetSurface on an unopened camera is unnecessary — it would only be
-            // overwritten (released + re-set) inside executePostOpenStartup() anyway.
-            // currentSurface is already saved above; executePostOpenStartup() will use it
-            // once the async permission grant fires openUsbConnectionAndSendToNative.
+            // currentSurface is already saved; tryStartPreview() will use it once the
+            // async permission grant fires openUsbConnectionAndSendToNative.
             usbPermissionHelper.requestPermission(usbManager, device)
         }
 
         isRecovering = false
         Log.d(
             "UVC",
-            "hardRecoverCameraSession: end — cameraReady=$cameraReady streaming=$streaming " +
+            "hardRecoverCameraSession: end — cameraOpened=$cameraOpened streaming=$streaming " +
                 "surfaceReady=$surfaceReady currentSurface=${currentSurface != null}"
         )
     }
@@ -446,34 +560,35 @@ class UvcController(
      *
      * Decision table:
      * - surface not ready  → nothing to do (surface callback will trigger later)
-     * - cameraReady && !streaming → restart stream (most common post-standby case)
-     * - !cameraReady && USB device reachable with permission → reopen camera
-     * - !cameraReady && USB device present without permission → re-request permission
+     * - cameraOpened && !streaming → call tryStartPreview (re-evaluates readiness gate)
+     * - !cameraOpened && USB device reachable with permission → reopen camera
+     * - !cameraOpened && USB device present without permission → re-request permission
      * - already streaming → log and skip
      */
     fun recoverPreviewIfNeeded() {
         Log.d(
             "UVC",
-            "recoverPreviewIfNeeded: cameraReady=$cameraReady streaming=$streaming " +
+            "recoverPreviewIfNeeded: cameraOpened=$cameraOpened streaming=$streaming " +
                 "surfaceReady=$surfaceReady nativeHandle=$nativeHandle"
         )
         when {
             !surfaceReady -> {
                 Log.d("UVC", "recoverPreviewIfNeeded: surface not attached — nothing to recover yet")
             }
-            cameraReady && streaming -> {
+            cameraOpened && streaming -> {
                 Log.d("UVC", "recoverPreviewIfNeeded: already streaming — no action needed")
             }
-            cameraReady && !streaming -> {
-                Log.d("UVC", "recoverPreviewIfNeeded: camera ready but stream inactive — restarting stream")
-                tryStartStream()
+            cameraOpened && !streaming -> {
+                Log.d("UVC", "recoverPreviewIfNeeded: camera ready but stream inactive — invoking tryStartPreview")
+                tryStartPreview()
             }
-            !cameraReady -> {
+            !cameraOpened -> {
                 Log.d("UVC", "recoverPreviewIfNeeded: camera not ready — scanning for USB device")
                 val device = findUvcDevice()
                 if (device != null) {
                     if (usbManager.hasPermission(device)) {
                         Log.d("UVC", "recoverPreviewIfNeeded: USB device found with permission — reopening camera")
+                        usbPermissionGranted = true
                         pendingCamera = device
                         openUsbConnectionAndSendToNative(device, entryPath = "soft-recovery")
                     } else {
@@ -489,7 +604,7 @@ class UvcController(
 
     /** Stub capture entry point; wired for future still-capture implementation. */
     fun requestCapture() {
-        Log.d("UVC", "requestCapture (stub) — streaming=$streaming cameraReady=$cameraReady")
+        Log.d("UVC", "requestCapture (stub) — streaming=$streaming cameraOpened=$cameraOpened")
     }
 
     /**
@@ -502,9 +617,11 @@ class UvcController(
 
         isOpening = false
         isRecovering = false
+        isStarting = false
         streaming = false
-        cameraReady = false
+        cameraOpened = false
         surfaceReady = false
+        usbPermissionGranted = false
 
         if (nativeHandle != 0L) {
             NativeBridge.nativeStopStream(nativeHandle)
@@ -526,21 +643,24 @@ class UvcController(
         Log.d("UVC", "handleUsbDetach: device detached — tearing down camera pipeline, preserving surface state")
         // Stop the stream and close the native/USB camera session.
         // surfaceReady is intentionally preserved: if the surface is still
-        // alive when the device reconnects, the post-open step inside
-        // openUsbConnectionAndSendToNative() will call nativeSetSurface and
-        // start the stream automatically.
-        // Reset isOpening so a fresh open is allowed on re-attach.
+        // alive when the device reconnects, tryStartPreview() will handle
+        // reattaching and starting the stream automatically.
+        // Reset isOpening/isStarting so a fresh open is allowed on re-attach.
         isOpening = false
+        isStarting = false
+        usbPermissionGranted = false
         streaming = false
-        cameraReady = false
+        cameraOpened = false
         if (nativeHandle != 0L) {
+            Log.d("UVC", "handleUsbDetach: invoking nativeStopStream")
             NativeBridge.nativeStopStream(nativeHandle)
             Log.d("UVC", "handleUsbDetach: nativeStopStream called")
+            Log.d("UVC", "handleUsbDetach: invoking nativeCloseUsbCamera")
             NativeBridge.nativeCloseUsbCamera(nativeHandle)
             Log.d("UVC", "handleUsbDetach: nativeCloseUsbCamera called")
         }
         closeUsbConnection()
-        Log.d("UVC", "handleUsbDetach: camera pipeline reset — cameraReady=false streaming=false surfaceReady=$surfaceReady")
+        Log.d("UVC", "handleUsbDetach: camera pipeline reset — cameraOpened=false streaming=false surfaceReady=$surfaceReady")
     }
 
     // -----------------------------------------------------------------------
@@ -596,7 +716,7 @@ class UvcController(
             }
 
             val openOk = NativeBridge.nativeOpenUsbCamera(nativeHandle)
-            Log.d("UVC", "[$entryPath] nativeOpenUsbCamera result=$openOk — USB open success")
+            Log.d("UVC", "[$entryPath] nativeOpenUsbCamera result=$openOk")
             if (!openOk) {
                 Log.e("UVC", "[$entryPath] nativeOpenUsbCamera failed")
                 return
@@ -605,54 +725,23 @@ class UvcController(
             val probeOk = NativeBridge.nativeProbeAndOpenUvc(nativeHandle)
             Log.d("UVC", "[$entryPath] nativeProbeAndOpenUvc result=$probeOk")
             if (!probeOk) {
-                Log.e("UVC", "[$entryPath] nativeProbeAndOpenUvc failed — aborting post-open")
-                cameraReady = false
+                Log.e("UVC", "[$entryPath] nativeProbeAndOpenUvc failed — aborting")
+                cameraOpened = false
                 return
             }
 
-            // Both paths (async-permission and already-granted) reach this single
-            // post-open startup function after a successful open.
-            executePostOpenStartup(entryPath)
-        } finally {
-            isOpening = false
-        }
-    }
-
-    /**
-     * Unified post-open startup: called after every successful USB/native open,
-     * regardless of which entry path (async-permission or already-granted) was used.
-     *
-     * Order:
-     *  1. Mark camera/session ready ([cameraReady] = true).
-     *  2. Obtain the current valid surface ([currentSurface]), if any.
-     *  3. If a surface is available: attach it to native ([NativeBridge.nativeSetSurface])
-     *     and start the MJPEG preview stream ([NativeBridge.nativeStartMjpegStream]).
-     *  4. If no valid surface is available: log and defer — stream will start via
-     *     [attachSurface] → [tryStartStream] when the surface arrives.
-     */
-    private fun executePostOpenStartup(entryPath: String) {
-        cameraReady = true
-        Log.d(
-            "UVC",
-            "POST-OPEN [$entryPath]: entering unified post-open startup — " +
-                "cameraReady=true currentSurface=${currentSurface != null} nativeHandle=$nativeHandle"
-        )
-        val cs = currentSurface
-        if (cs != null && nativeHandle != 0L) {
-            Log.d("UVC", "POST-OPEN [$entryPath]: surface available — calling nativeSetSurface")
-            NativeBridge.nativeSetSurface(nativeHandle, cs)
-            surfaceReady = true
-            Log.d("UVC", "POST-OPEN [$entryPath]: nativeSetSurface done — calling nativeStartMjpegStream")
-            val streamOk = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
-            streaming = streamOk
-            Log.d("UVC", "POST-OPEN [$entryPath]: nativeStartMjpegStream result=$streamOk → streaming=$streaming")
-        } else {
+            // Camera is ready — mark it open and let the unified readiness gate
+            // decide whether to start the stream.  tryStartPreview() checks all
+            // remaining prerequisites (usbPermissionGranted, valid surface, etc.)
+            // and starts exactly once when all are satisfied.
+            cameraOpened = true
             Log.d(
                 "UVC",
-                "POST-OPEN [$entryPath]: no valid surface available " +
-                    "(currentSurface=${currentSurface != null} nativeHandle=$nativeHandle) — " +
-                    "stream deferred until attachSurface is called"
+                "[$entryPath] camera opened — cameraOpened=true — invoking tryStartPreview"
             )
+            tryStartPreview()
+        } finally {
+            isOpening = false
         }
     }
 
@@ -716,6 +805,7 @@ class UvcController(
                 onUsbDeviceEngaged?.invoke()
                 if (usbManager.hasPermission(device)) {
                     Log.d("UVC", "USB permission already granted for ${device.deviceName}")
+                    usbPermissionGranted = true
                     pendingCamera = device
                     openUsbConnectionAndSendToNative(device, entryPath = "scan-already-granted")
                 } else {
