@@ -25,13 +25,14 @@ import androidx.appcompat.app.AppCompatActivity
  *  - onDestroy → unbind from [CameraService] (triggers full session teardown
  *                only when the Activity is truly being destroyed).
  *  - SurfaceHolder.Callback:
- *      surfaceCreated   → if camera already open: reattach surface only
- *                         (deterministic reattach without pipeline teardown);
- *                         if camera not open: trigger hard recovery.
+ *      surfaceCreated   → evaluate preview health via [CameraService.evaluatePreviewRecoveryNeeded]
+ *                         and dispatch to the cheapest applicable recovery path
+ *                         (ATTACH_ONLY / STREAM_RESTART_ONLY / SOFT_PREVIEW_RECOVERY / HARD_RECOVER);
+ *                         schedule post-create health watchdog.
  *      surfaceChanged   → refresh native surface handle (dimension update).
  *      surfaceDestroyed → stop stream + clear surface ref; camera stays open.
- *  - onResume → if service bound and surface valid: smart reattach
- *               (reattach-only if camera open, hard-recovery if camera closed).
+ *  - onResume → if service bound and surface valid: evaluate preview health and
+ *               dispatch recovery; schedule post-resume health watchdog.
  *  - onKeyDown (volume-down / KEYCODE_CAMERA) → trigger capture.
  */
 class MainActivity : AppCompatActivity() {
@@ -55,25 +56,39 @@ class MainActivity : AppCompatActivity() {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             cameraService = (binder as CameraService.LocalBinder).getService()
             serviceBound = true
-            val cameraOpen = cameraService?.isCameraOpen() ?: false
             val holder = previewSurface.holder
             val surfaceValid = holder.surface.isValid
+            val decision = cameraService?.evaluatePreviewRecoveryNeeded()
             Log.d(
                 TAG,
-                "UVC_STATE: SERVICE_BIND — cameraOpen=$cameraOpen surfaceValid=$surfaceValid " +
-                    "streaming=${cameraService?.isStreaming()}"
+                "UVC_STATE: SERVICE_BIND — surfaceValid=$surfaceValid " +
+                    "streaming=${cameraService?.isStreaming()} decision=$decision"
             )
 
             if (surfaceValid) {
-                if (cameraOpen) {
-                    // Camera session is alive; just reattach the surface without teardown.
-                    Log.d(TAG, "UVC_STATE: SERVICE_BIND — camera open, reattaching surface only")
-                    cameraService?.attachSurface(holder.surface)
-                } else {
-                    // Camera not open yet (first start or after USB detach); full recovery needed.
-                    Log.d(TAG, "UVC_STATE: SERVICE_BIND — camera not open, triggering hard recovery")
-                    cameraService?.hardRecoverCameraSession(holder.surface)
+                val surface = holder.surface
+                when (decision) {
+                    PreviewRecoveryDecision.NO_OP -> {
+                        Log.d(TAG, "UVC_HEALTH: SERVICE_BIND → NO_OP")
+                    }
+                    PreviewRecoveryDecision.ATTACH_ONLY -> {
+                        Log.d(TAG, "UVC_HEALTH: SERVICE_BIND → ATTACH_ONLY")
+                        cameraService?.attachSurface(surface)
+                    }
+                    PreviewRecoveryDecision.STREAM_RESTART_ONLY -> {
+                        Log.d(TAG, "UVC_HEALTH: SERVICE_BIND → STREAM_RESTART_ONLY")
+                        cameraService?.attachSurface(surface)
+                    }
+                    PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY -> {
+                        Log.d(TAG, "UVC_HEALTH: SERVICE_BIND → SOFT_PREVIEW_RECOVERY")
+                        cameraService?.softPreviewRecovery(surface)
+                    }
+                    PreviewRecoveryDecision.HARD_RECOVER, null -> {
+                        Log.d(TAG, "UVC_HEALTH: SERVICE_BIND → HARD_RECOVER")
+                        cameraService?.hardRecoverCameraSession(surface)
+                    }
                 }
+                cameraService?.schedulePreviewWatchdog()
             } else {
                 // Surface not yet available; surfaceCreated will handle attachment when it fires.
                 Log.d(TAG, "UVC_STATE: SERVICE_BIND — surface not yet valid, waiting for surfaceCreated")
@@ -95,25 +110,37 @@ class MainActivity : AppCompatActivity() {
 
     private val surfaceCallback = object : SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {
-            val cameraOpen = cameraService?.isCameraOpen() ?: false
+            val decision = cameraService?.evaluatePreviewRecoveryNeeded()
             Log.d(
                 TAG,
-                "UVC_STATE: SURFACE_CREATE — cameraOpen=$cameraOpen serviceBound=$serviceBound " +
+                "UVC_STATE: SURFACE_CREATE — serviceBound=$serviceBound " +
                     "streaming=${cameraService?.isStreaming()} " +
-                    "surfaceHash=${System.identityHashCode(holder.surface)}"
+                    "surfaceHash=${System.identityHashCode(holder.surface)} " +
+                    "decision=$decision"
             )
-            if (cameraOpen) {
-                // Camera session survived the background transition; just reattach the surface.
-                // This avoids the destructive close/reopen cycle that caused black-screen roulette
-                // on repeated HOME → return cycles.
-                Log.d(TAG, "UVC_STATE: SURFACE_CREATE — camera open, reattaching surface (no teardown)")
-                cameraService?.attachSurface(holder.surface)
-            } else {
-                // Camera not open yet (first launch, USB detach/reattach, or unrecoverable failure).
-                // Full recovery is required to open the session from a clean state.
-                Log.d(TAG, "UVC_STATE: SURFACE_CREATE — camera not open, triggering hard recovery")
-                cameraService?.hardRecoverCameraSession(holder.surface)
+            val surface = holder.surface
+            when (decision) {
+                PreviewRecoveryDecision.NO_OP -> {
+                    Log.d(TAG, "UVC_HEALTH: SURFACE_CREATE → NO_OP")
+                }
+                PreviewRecoveryDecision.ATTACH_ONLY -> {
+                    Log.d(TAG, "UVC_HEALTH: SURFACE_CREATE → ATTACH_ONLY")
+                    cameraService?.attachSurface(surface)
+                }
+                PreviewRecoveryDecision.STREAM_RESTART_ONLY -> {
+                    Log.d(TAG, "UVC_HEALTH: SURFACE_CREATE → STREAM_RESTART_ONLY")
+                    cameraService?.attachSurface(surface)
+                }
+                PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY -> {
+                    Log.d(TAG, "UVC_HEALTH: SURFACE_CREATE → SOFT_PREVIEW_RECOVERY")
+                    cameraService?.softPreviewRecovery(surface)
+                }
+                PreviewRecoveryDecision.HARD_RECOVER, null -> {
+                    Log.d(TAG, "UVC_HEALTH: SURFACE_CREATE → HARD_RECOVER")
+                    cameraService?.hardRecoverCameraSession(surface)
+                }
             }
+            cameraService?.schedulePreviewWatchdog()
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -173,24 +200,36 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         val holder = previewSurface.holder
         val surfaceValid = holder.surface.isValid
-        val cameraOpen = cameraService?.isCameraOpen() ?: false
+        val decision = if (serviceBound && surfaceValid) cameraService?.evaluatePreviewRecoveryNeeded() else null
         Log.d(
             TAG,
             "UVC_STATE: ACT_RESUME — serviceBound=$serviceBound surfaceValid=$surfaceValid " +
-                "cameraOpen=$cameraOpen streaming=${cameraService?.isStreaming()}"
+                "streaming=${cameraService?.isStreaming()} decision=$decision"
         )
         if (serviceBound && surfaceValid) {
-            if (cameraOpen) {
-                // Camera session is still alive. Just reattach the surface if the stream
-                // was stopped (e.g., surfaceDestroyed already fired), or refresh it if
-                // dimensions changed. tryStartPreview handles the streaming=true guard.
-                Log.d(TAG, "UVC_STATE: ACT_RESUME — camera open, reattaching surface only")
-                cameraService?.attachSurface(holder.surface)
-            } else {
-                // Camera was closed (USB detach, first launch, or unrecoverable failure).
-                Log.d(TAG, "UVC_STATE: ACT_RESUME — camera not open, triggering hard recovery")
-                cameraService?.hardRecoverCameraSession(holder.surface)
+            val surface = holder.surface
+            when (decision) {
+                PreviewRecoveryDecision.NO_OP -> {
+                    Log.d(TAG, "UVC_HEALTH: ACT_RESUME → NO_OP")
+                }
+                PreviewRecoveryDecision.ATTACH_ONLY -> {
+                    Log.d(TAG, "UVC_HEALTH: ACT_RESUME → ATTACH_ONLY")
+                    cameraService?.attachSurface(surface)
+                }
+                PreviewRecoveryDecision.STREAM_RESTART_ONLY -> {
+                    Log.d(TAG, "UVC_HEALTH: ACT_RESUME → STREAM_RESTART_ONLY")
+                    cameraService?.attachSurface(surface)
+                }
+                PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY -> {
+                    Log.d(TAG, "UVC_HEALTH: ACT_RESUME → SOFT_PREVIEW_RECOVERY")
+                    cameraService?.softPreviewRecovery(surface)
+                }
+                PreviewRecoveryDecision.HARD_RECOVER, null -> {
+                    Log.d(TAG, "UVC_HEALTH: ACT_RESUME → HARD_RECOVER")
+                    cameraService?.hardRecoverCameraSession(surface)
+                }
             }
+            cameraService?.schedulePreviewWatchdog()
         }
     }
 

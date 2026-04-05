@@ -201,6 +201,42 @@ class CameraService : Service() {
     fun isCameraOpen(): Boolean = uvcController.isCameraOpen()
 
     /**
+     * Evaluate what recovery action is needed for the current preview state.
+     * Returns a [PreviewRecoveryDecision] that lifecycle hooks use to dispatch
+     * to the cheapest applicable recovery path.
+     */
+    fun evaluatePreviewRecoveryNeeded(): PreviewRecoveryDecision =
+        uvcController.evaluatePreviewRecoveryNeeded()
+
+    /**
+     * Soft preview recovery: detach and re-attach the render surface and
+     * restart the MJPEG stream without closing the USB camera.
+     */
+    fun softPreviewRecovery(surface: Surface) {
+        Log.d(TAG, "softPreviewRecovery surfaceHash=${System.identityHashCode(surface)}")
+        uvcController.softPreviewRecovery(surface)
+    }
+
+    /**
+     * Restart only the MJPEG stream without closing the USB camera.
+     * Use when the camera is open but the stream needs to be cycled.
+     */
+    fun restartPreviewStreamOnly() {
+        Log.d(TAG, "restartPreviewStreamOnly")
+        uvcController.restartPreviewStreamOnly()
+    }
+
+    /**
+     * Schedule the post-resume health watchdog.  If the preview is still not
+     * healthy ~1 300 ms after this call, [softPreviewRecovery] is invoked
+     * automatically.
+     */
+    fun schedulePreviewWatchdog() {
+        Log.d(TAG, "schedulePreviewWatchdog")
+        uvcController.schedulePreviewWatchdog()
+    }
+
+    /**
      * Lightweight soft-recovery path.  Prefer [hardRecoverCameraSession] when
      * returning from background or after any standby cycle where the pipeline
      * may be in a stale or corrupted state.
