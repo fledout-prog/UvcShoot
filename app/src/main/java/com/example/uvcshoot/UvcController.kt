@@ -69,8 +69,11 @@ class UvcController(
      * Last valid Surface provided by the Activity.  Persists across hard-recovery
      * cycles so it can be reattached after the camera reopens.  Only cleared when
      * the surface is truly destroyed ([onSurfaceDestroyed]).
+     *
+     * Marked `@Volatile` so reads in non-synchronized methods (e.g. [attachSurface],
+     * [openUsbConnectionAndSendToNative]) always see the most recent write.
      */
-    private var currentSurface: Surface? = null
+    @Volatile private var currentSurface: Surface? = null
 
     /**
      * Guard against back-to-back [hardRecoverCameraSession] calls.  Set at the
@@ -78,9 +81,11 @@ class UvcController(
      * Prevents duplicate teardown+reopen sequences triggered by rapid lifecycle
      * callbacks (onResume + surfaceCreated + onServiceConnected).
      *
-     * Access is serialized by the [synchronized] block in [hardRecoverCameraSession].
+     * Marked `@Volatile` for cross-thread visibility (consistent with [streaming]).
+     * Write-then-check atomicity within [hardRecoverCameraSession] is ensured by
+     * its [@Synchronized] annotation.
      */
-    private var isRecovering = false
+    @Volatile private var isRecovering = false
 
     /** Returns true while the MJPEG stream is running. */
     fun isStreaming(): Boolean = streaming
