@@ -19,15 +19,20 @@ import androidx.appcompat.app.AppCompatActivity
  * to [CameraService] and acts only as a surface/UI bridge.
  *
  * Lifecycle contract:
- *  - onStart  → bind to [CameraService] (service is NOT started here;
- *               it promotes itself to foreground once a USB device is engaged)
- *  - onStop   → stop preview pipeline + unbind (service closes camera session
- *               via onUnbind, ensuring a clean state on next bind)
- *  - SurfaceHolder.Callback → hard-recover on surfaceCreated (the definitive
- *    recovery point after any standby/background cycle); attachSurface on
- *    surfaceChanged (dimension update only); stopPreviewPipeline on
- *    surfaceDestroyed.
- *  - onKeyDown (volume-down / KEYCODE_CAMERA) → trigger capture
+ *  - onCreate → bind to [CameraService] once; binding is kept alive across
+ *               HOME/return cycles so the camera session is never needlessly
+ *               destroyed for transient background transitions.
+ *  - onDestroy → unbind from [CameraService] (triggers full session teardown
+ *                only when the Activity is truly being destroyed).
+ *  - SurfaceHolder.Callback:
+ *      surfaceCreated   → if camera already open: reattach surface only
+ *                         (deterministic reattach without pipeline teardown);
+ *                         if camera not open: trigger hard recovery.
+ *      surfaceChanged   → refresh native surface handle (dimension update).
+ *      surfaceDestroyed → stop stream + clear surface ref; camera stays open.
+ *  - onResume → if service bound and surface valid: smart reattach
+ *               (reattach-only if camera open, hard-recovery if camera closed).
+ *  - onKeyDown (volume-down / KEYCODE_CAMERA) → trigger capture.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -48,24 +53,36 @@ class MainActivity : AppCompatActivity() {
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
-            Log.d(TAG, "onServiceConnected")
             cameraService = (binder as CameraService.LocalBinder).getService()
             serviceBound = true
-
-            // If the SurfaceView already has a valid surface (e.g., quick
-            // resume where surfaceCreated was not re-fired), kick off a hard
-            // recovery so the pipeline opens from a known-clean state rather
-            // than assuming any prior state is still healthy.
+            val cameraOpen = cameraService?.isCameraOpen() ?: false
             val holder = previewSurface.holder
-            if (holder.surface != null && holder.surface.isValid) {
-                Log.d(TAG, "onServiceConnected: surface already valid — triggering hard recovery")
-                cameraService?.hardRecoverCameraSession(holder.surface)
+            val surfaceValid = holder.surface.isValid
+            Log.d(
+                TAG,
+                "UVC_STATE: SERVICE_BIND — cameraOpen=$cameraOpen surfaceValid=$surfaceValid " +
+                    "streaming=${cameraService?.isStreaming()}"
+            )
+
+            if (surfaceValid) {
+                if (cameraOpen) {
+                    // Camera session is alive; just reattach the surface without teardown.
+                    Log.d(TAG, "UVC_STATE: SERVICE_BIND — camera open, reattaching surface only")
+                    cameraService?.attachSurface(holder.surface)
+                } else {
+                    // Camera not open yet (first start or after USB detach); full recovery needed.
+                    Log.d(TAG, "UVC_STATE: SERVICE_BIND — camera not open, triggering hard recovery")
+                    cameraService?.hardRecoverCameraSession(holder.surface)
+                }
+            } else {
+                // Surface not yet available; surfaceCreated will handle attachment when it fires.
+                Log.d(TAG, "UVC_STATE: SERVICE_BIND — surface not yet valid, waiting for surfaceCreated")
             }
             updateStatus("Camera service connected")
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
-            Log.d(TAG, "onServiceDisconnected")
+            Log.d(TAG, "UVC_STATE: SERVICE_DISCONNECT — unexpected service disconnect")
             cameraService = null
             serviceBound = false
             updateStatus("Camera service disconnected")
@@ -78,25 +95,33 @@ class MainActivity : AppCompatActivity() {
 
     private val surfaceCallback = object : SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {
+            val cameraOpen = cameraService?.isCameraOpen() ?: false
             Log.d(
                 TAG,
-                "surfaceCreated — serviceBound=$serviceBound " +
-                    "streaming=${cameraService?.isStreaming()}"
+                "UVC_STATE: SURFACE_CREATE — cameraOpen=$cameraOpen serviceBound=$serviceBound " +
+                    "streaming=${cameraService?.isStreaming()} " +
+                    "surfaceHash=${System.identityHashCode(holder.surface)}"
             )
-            // Hard recovery: always tear down and reopen from clean state when
-            // a new surface is created.  This is the primary recovery point
-            // after standby, lock/unlock, or any background cycle.  It prevents
-            // the pipeline from reopening on top of stale native/USB state —
-            // which was the root cause of corrupted frames (bands/lines) and
-            // black-screen resume.
-            cameraService?.hardRecoverCameraSession(holder.surface)
+            if (cameraOpen) {
+                // Camera session survived the background transition; just reattach the surface.
+                // This avoids the destructive close/reopen cycle that caused black-screen roulette
+                // on repeated HOME → return cycles.
+                Log.d(TAG, "UVC_STATE: SURFACE_CREATE — camera open, reattaching surface (no teardown)")
+                cameraService?.attachSurface(holder.surface)
+            } else {
+                // Camera not open yet (first launch, USB detach/reattach, or unrecoverable failure).
+                // Full recovery is required to open the session from a clean state.
+                Log.d(TAG, "UVC_STATE: SURFACE_CREATE — camera not open, triggering hard recovery")
+                cameraService?.hardRecoverCameraSession(holder.surface)
+            }
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
             Log.d(
                 TAG,
-                "surfaceChanged ${width}x${height} — serviceBound=$serviceBound " +
-                    "streaming=${cameraService?.isStreaming()}"
+                "UVC_STATE: SURFACE_CHANGE — ${width}x${height} serviceBound=$serviceBound " +
+                    "streaming=${cameraService?.isStreaming()} " +
+                    "surfaceHash=${System.identityHashCode(holder.surface)}"
             )
             // Surface dimensions changed; refresh the native window handle
             // without a full pipeline teardown.
@@ -104,11 +129,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
-            Log.d(TAG, "surfaceDestroyed — serviceBound=$serviceBound")
-            // Surface is truly gone: clear the surface reference in the controller
-            // (so it is not accidentally reattached to the dead native window) and
-            // stop the MJPEG stream.  The camera session is fully closed by
-            // CameraService.onUnbind() when the Activity unbinds.
+            Log.d(
+                TAG,
+                "UVC_STATE: SURFACE_DESTROY — serviceBound=$serviceBound streaming=${cameraService?.isStreaming()} " +
+                    "surfaceHash=${System.identityHashCode(holder.surface)}"
+            )
+            // Surface is truly gone: stop the stream and clear the surface reference in the
+            // controller. The camera session (USB/UVC handle) remains open so it does not
+            // need to be fully re-probed when the surface comes back (e.g. on return from HOME).
             cameraService?.onSurfaceDestroyed()
         }
     }
@@ -129,52 +157,60 @@ class MainActivity : AppCompatActivity() {
 
         captureButton.setOnClickListener { triggerCapture() }
 
+        Log.d(TAG, "UVC_STATE: ACT_CREATE — binding to CameraService (binding kept alive across HOME/return)")
         updateStatus("Starting camera service…")
+        // Bind here (not in onStart) so the service binding — and its camera session —
+        // survive HOME/temporary background transitions without a destructive teardown.
+        bindToService()
     }
 
     override fun onStart() {
         super.onStart()
-        bindToService()
+        Log.d(TAG, "UVC_STATE: ACT_START — serviceBound=$serviceBound")
     }
 
     override fun onResume() {
         super.onResume()
-        // Hard recovery point: after returning from standby, background, or any
-        // pause/resume cycle that did not trigger onStop (and therefore did not
-        // rebind the service), ensure the pipeline is torn down and reopened
-        // from a clean state if the service is already bound and the surface is
-        // valid.  This covers the case where surfaceCreated is not re-fired
-        // (surface survived the pause) and onServiceConnected is not re-fired
-        // (service was already bound).
         val holder = previewSurface.holder
         val surfaceValid = holder.surface.isValid
+        val cameraOpen = cameraService?.isCameraOpen() ?: false
         Log.d(
             TAG,
-            "onResume — serviceBound=$serviceBound surfaceValid=$surfaceValid " +
-                "streaming=${cameraService?.isStreaming()}"
+            "UVC_STATE: ACT_RESUME — serviceBound=$serviceBound surfaceValid=$surfaceValid " +
+                "cameraOpen=$cameraOpen streaming=${cameraService?.isStreaming()}"
         )
         if (serviceBound && surfaceValid) {
-            Log.d(TAG, "onResume: service bound and surface valid — triggering hard recovery")
-            cameraService?.hardRecoverCameraSession(holder.surface)
+            if (cameraOpen) {
+                // Camera session is still alive. Just reattach the surface if the stream
+                // was stopped (e.g., surfaceDestroyed already fired), or refresh it if
+                // dimensions changed. tryStartPreview handles the streaming=true guard.
+                Log.d(TAG, "UVC_STATE: ACT_RESUME — camera open, reattaching surface only")
+                cameraService?.attachSurface(holder.surface)
+            } else {
+                // Camera was closed (USB detach, first launch, or unrecoverable failure).
+                Log.d(TAG, "UVC_STATE: ACT_RESUME — camera not open, triggering hard recovery")
+                cameraService?.hardRecoverCameraSession(holder.surface)
+            }
         }
     }
 
     override fun onStop() {
-        if (serviceBound) {
-            // Unbind from the service.  CameraService.onUnbind() performs the
-            // full hard teardown (closeCameraSession: stop stream + close native
-            // UVC + close USB connection) so the pipeline is in a clean state
-            // when the Activity rebinds.
-            unbindService(serviceConnection)
-            serviceBound = false
-            cameraService = null
-            Log.d(TAG, "onStop: unbound from service — full hard teardown via onUnbind")
-        }
+        Log.d(TAG, "UVC_STATE: ACT_STOP — keeping service binding alive (camera session preserved for resume)")
+        // Intentionally NOT unbinding here. The service binding and camera session must survive
+        // HOME / temporary background transitions. Unbinding is deferred to onDestroy so that
+        // full teardown only happens when the Activity is truly being destroyed.
         super.onStop()
     }
 
     override fun onDestroy() {
+        Log.d(TAG, "UVC_STATE: ACT_DESTROY — unbinding service (full teardown on true Activity destruction)")
         previewSurface.holder.removeCallback(surfaceCallback)
+        if (serviceBound) {
+            // onUnbind will perform the full camera session teardown.
+            unbindService(serviceConnection)
+            serviceBound = false
+            cameraService = null
+        }
         super.onDestroy()
     }
 

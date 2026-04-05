@@ -115,6 +115,9 @@ class UvcController(
     /** Returns true while the MJPEG stream is running. */
     fun isStreaming(): Boolean = streaming
 
+    /** Returns true when the UVC camera session is currently open. */
+    fun isCameraOpen(): Boolean = cameraOpened
+
     // -----------------------------------------------------------------------
     // Unified readiness gate
     // -----------------------------------------------------------------------
@@ -196,13 +199,13 @@ class UvcController(
         // All prerequisites satisfied — start the preview pipeline exactly once.
         isStarting = true
         try {
-            Log.d("UVC", "tryStartPreview: all prerequisites satisfied — invoking nativeSetSurface")
+            Log.d("UVC", "UVC_STATE: STREAM_START — all prerequisites satisfied, invoking nativeSetSurface")
             NativeBridge.nativeSetSurface(nativeHandle, cs)
             surfaceReady = true
-            Log.d("UVC", "tryStartPreview: invoking nativeStartMjpegStream")
+            Log.d("UVC", "UVC_STATE: STREAM_START — invoking nativeStartMjpegStream")
             val ok = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
             streaming = ok
-            Log.d("UVC", "tryStartPreview: nativeStartMjpegStream result=$ok → streaming=$streaming")
+            Log.d("UVC", "UVC_STATE: STREAM_START — nativeStartMjpegStream result=$ok → streaming=$streaming")
         } finally {
             isStarting = false
         }
@@ -334,7 +337,7 @@ class UvcController(
     fun onSurfaceDestroyed() {
         Log.d(
             "UVC",
-            "onSurfaceDestroyed: surface truly destroyed — clearing currentSurface and stopping stream " +
+            "UVC_STATE: SURFACE_DETACH_ONLY — surface truly destroyed, clearing currentSurface and stopping stream " +
                 "(cameraOpened=$cameraOpened streaming=$streaming)"
         )
         currentSurface = null
@@ -369,7 +372,8 @@ class UvcController(
     fun stopPreviewPipeline() {
         Log.d(
             "UVC",
-            "stopPreviewPipeline: streaming=$streaming cameraOpened=$cameraOpened — stopping stream, surface detached"
+            "UVC_STATE: SURFACE_DETACH_ONLY — stopPreviewPipeline: streaming=$streaming cameraOpened=$cameraOpened " +
+                "(stream stopped, camera session kept open)"
         )
         surfaceReady = false
         if (nativeHandle != 0L) {
@@ -404,7 +408,7 @@ class UvcController(
     fun closeCameraSession() {
         Log.d(
             "UVC",
-            "closeCameraSession: TEARDOWN BEGIN — streaming=$streaming " +
+            "UVC_STATE: FULL_TEARDOWN BEGIN — reason=closeCameraSession streaming=$streaming " +
                 "cameraOpened=$cameraOpened nativeHandle=$nativeHandle"
         )
         // Reset open/start guards first so a fresh open is always allowed after teardown.
@@ -449,7 +453,7 @@ class UvcController(
 
         Log.d(
             "UVC",
-            "closeCameraSession: TEARDOWN COMPLETE — " +
+            "UVC_STATE: FULL_TEARDOWN COMPLETE — " +
                 "cameraOpened=false streaming=false surfaceReady=false usbPermissionGranted=false"
         )
     }
@@ -510,7 +514,7 @@ class UvcController(
         isRecovering = true
         Log.d(
             "UVC",
-            "hardRecoverCameraSession: begin — currentSurface=${currentSurface != null} " +
+            "UVC_STATE: FULL_TEARDOWN BEGIN — reason=hardRecoverCameraSession: currentSurface=${currentSurface != null} " +
                 "cameraOpened=$cameraOpened streaming=$streaming surfaceReady=$surfaceReady"
         )
 
@@ -649,7 +653,10 @@ class UvcController(
     // -----------------------------------------------------------------------
 
     private fun handleUsbDetach() {
-        Log.d("UVC", "handleUsbDetach: device detached — tearing down camera pipeline, preserving surface state")
+        Log.d(
+            "UVC",
+            "UVC_STATE: FULL_TEARDOWN BEGIN — reason=USB_DETACH: device detached, tearing down camera pipeline"
+        )
         // Stop the stream and close the native/USB camera session.
         // surfaceReady is intentionally preserved: if the surface is still
         // alive when the device reconnects, tryStartPreview() will handle
@@ -669,7 +676,11 @@ class UvcController(
             Log.d("UVC", "handleUsbDetach: nativeCloseUsbCamera called")
         }
         closeUsbConnection()
-        Log.d("UVC", "handleUsbDetach: camera pipeline reset — cameraOpened=false streaming=false surfaceReady=$surfaceReady")
+        Log.d(
+            "UVC",
+            "UVC_STATE: FULL_TEARDOWN COMPLETE — reason=USB_DETACH: " +
+                "cameraOpened=false streaming=false surfaceReady=$surfaceReady"
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -746,7 +757,8 @@ class UvcController(
             cameraOpened = true
             Log.d(
                 "UVC",
-                "[$entryPath] camera opened — cameraOpened=true — invoking tryStartPreview"
+                "UVC_STATE: CAMERA_OPEN — [$entryPath] camera opened successfully " +
+                    "cameraOpened=true nativeHandle=$nativeHandle — invoking tryStartPreview"
             )
             tryStartPreview()
         } finally {
