@@ -13,3 +13,8 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# kotlinc build artifacts
+META-INF/
+*.class
+com/

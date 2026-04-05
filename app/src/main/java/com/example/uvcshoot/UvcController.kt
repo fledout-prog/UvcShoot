@@ -9,8 +9,29 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+
+/**
+ * Decision categories for preview recovery, ordered from cheapest to most expensive.
+ * Returned by [UvcController.evaluatePreviewRecoveryNeeded] and acted on in
+ * MainActivity lifecycle hooks.
+ */
+enum class PreviewRecoveryDecision {
+    /** Preview pipeline is healthy; no action required. */
+    NO_OP,
+    /** Camera open and stream running; surface needs to be re-attached (generation changed). */
+    ATTACH_ONLY,
+    /** Camera open but stream not running; restart stream only without closing camera. */
+    STREAM_RESTART_ONLY,
+    /** Camera open, stream running, but preview is not healthy (surface mismatch or no recent frames). */
+    SOFT_PREVIEW_RECOVERY,
+    /** Camera not open; full pipeline teardown and reopen required. */
+    HARD_RECOVER,
+}
 
 /**
  * Owns the USB/UVC camera pipeline: native handle, USB connection, UVC
@@ -112,11 +133,89 @@ class UvcController(
      */
     @Volatile private var isOpening = false
 
+    // --- Preview health state ---
+    // These fields track the fine-grained health of the preview pipeline beyond
+    // the single `cameraOpened` flag.  Used by [isPreviewHealthy],
+    // [evaluatePreviewRecoveryNeeded], and [softPreviewRecovery].
+
+    /**
+     * Canonical name for the stream-running state; mirrors [streaming].
+     * Exposed as a read-only property to allow [evaluatePreviewRecoveryNeeded]
+     * to reference it by the documented name.
+     */
+    val streamRunning: Boolean get() = streaming
+
+    /**
+     * True when [NativeBridge.nativeSetSurface] has been called with the
+     * current [currentSurface] (non-null) so the native render path is bound.
+     * Reset to false whenever the surface is detached or the pipeline is torn down.
+     */
+    @Volatile private var surfaceAttached: Boolean = false
+
+    /**
+     * Monotonically incremented each time a genuinely new/replaced [Surface]
+     * object is registered via [attachSurface].  Sameness is determined by
+     * object identity (`===`), not value equality.
+     */
+    private var currentSurfaceGeneration: Long = 0L
+
+    /**
+     * The value of [currentSurfaceGeneration] at the time
+     * [NativeBridge.nativeSetSurface] was last successfully called with a
+     * non-null surface.  When this diverges from [currentSurfaceGeneration] the
+     * native render path is bound to a stale surface and soft recovery is needed.
+     */
+    private var attachedSurfaceGeneration: Long = -1L
+
+    /**
+     * Timestamp (ms, [SystemClock.elapsedRealtime]) of the last confirmed frame
+     * delivery to the active preview path.  Updated exclusively by
+     * [FrameCallback.onFrame]; never set at stream-start time alone.
+     * A value of 0 means no frame has been confirmed yet in this session.
+     */
+    @Volatile var lastFrameRenderedAtMs: Long = 0L
+
+    /** Handler on the main looper, used to post the post-resume health watchdog. */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** The currently scheduled watchdog [Runnable], or null if none is pending. */
+    private var watchdogRunnable: Runnable? = null
+
     /** Returns true while the MJPEG stream is running. */
     fun isStreaming(): Boolean = streaming
 
     /** Returns true when the UVC camera session is currently open. */
     fun isCameraOpen(): Boolean = cameraOpened
+
+    // -----------------------------------------------------------------------
+    // JNI frame-delivery callback
+    // -----------------------------------------------------------------------
+
+    /**
+     * Registered with [NativeBridge.nativeSetFrameListener] so the native MJPEG
+     * decoder can notify us when a decoded frame is about to be rendered onto the
+     * preview [Surface].  This is the authoritative source for [lastFrameRenderedAtMs]:
+     * it represents an actual frame reaching the active render path, not merely a
+     * successful stream-start command.
+     *
+     * The method name and signature must match the JNI reflection lookup in the
+     * native layer (`onFrame(byte[], int)`).
+     */
+    private inner class FrameCallback {
+        @Suppress("unused") // invoked from JNI via reflection
+        fun onFrame(data: ByteArray?, length: Int) {
+            val now = SystemClock.elapsedRealtime()
+            if (lastFrameRenderedAtMs == 0L) {
+                Log.d(
+                    "UVC",
+                    "UVC_HEALTH: FIRST_FRAME — first frame confirmed at preview path at ${now}ms"
+                )
+            }
+            lastFrameRenderedAtMs = now
+        }
+    }
+
+    private val frameCallback = FrameCallback()
 
     // -----------------------------------------------------------------------
     // Unified readiness gate
@@ -177,6 +276,7 @@ class UvcController(
                 Log.d("UVC", "tryStartPreview: clearing stale/invalid surface reference")
                 currentSurface = null
                 surfaceReady = false
+                surfaceAttached = false
             }
             return
         }
@@ -187,7 +287,13 @@ class UvcController(
             Log.d("UVC", "tryStartPreview: already streaming — refreshing surface reference only")
             if (cs != null && cs.isValid && nativeHandle != 0L) {
                 NativeBridge.nativeSetSurface(nativeHandle, cs)
-                Log.d("UVC", "tryStartPreview: nativeSetSurface called (streaming refresh)")
+                surfaceAttached = true
+                attachedSurfaceGeneration = currentSurfaceGeneration
+                Log.d(
+                    "UVC",
+                    "tryStartPreview: nativeSetSurface called (streaming refresh) " +
+                        "attachedSurfaceGeneration=$attachedSurfaceGeneration"
+                )
             }
             return
         }
@@ -201,11 +307,20 @@ class UvcController(
         try {
             Log.d("UVC", "UVC_STATE: STREAM_START — all prerequisites satisfied, invoking nativeSetSurface")
             NativeBridge.nativeSetSurface(nativeHandle, cs)
+            surfaceAttached = true
+            attachedSurfaceGeneration = currentSurfaceGeneration
             surfaceReady = true
+            // Register frame callback before starting stream so the first decoded
+            // frame updates lastFrameRenderedAtMs via FrameCallback.onFrame().
+            NativeBridge.nativeSetFrameListener(nativeHandle, frameCallback)
             Log.d("UVC", "UVC_STATE: STREAM_START — invoking nativeStartMjpegStream")
             val ok = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
             streaming = ok
-            Log.d("UVC", "UVC_STATE: STREAM_START — nativeStartMjpegStream result=$ok → streaming=$streaming")
+            Log.d(
+                "UVC",
+                "UVC_STATE: STREAM_START — nativeStartMjpegStream result=$ok → streaming=$streaming " +
+                    "surfaceAttached=$surfaceAttached attachedSurfaceGeneration=$attachedSurfaceGeneration"
+            )
         } finally {
             isStarting = false
         }
@@ -299,8 +414,9 @@ class UvcController(
     }
 
     /**
-     * Attach a preview [Surface].  Updates [currentSurface] and invokes the
-     * unified readiness gate ([tryStartPreview]).
+     * Attach a preview [Surface].  Updates [currentSurface], increments
+     * [currentSurfaceGeneration] when a genuinely new surface object is provided,
+     * and invokes the unified readiness gate ([tryStartPreview]).
      *
      * [tryStartPreview] handles both cases:
      *  - Stream not yet started: attaches surface and starts stream when all
@@ -312,6 +428,21 @@ class UvcController(
      * instead.
      */
     fun attachSurface(surface: Surface) {
+        val isNewSurface = surface !== currentSurface
+        if (isNewSurface) {
+            currentSurfaceGeneration++
+            Log.d(
+                "UVC",
+                "UVC_HEALTH: attachSurface — NEW surface hash=${System.identityHashCode(surface)} " +
+                    "generation=$currentSurfaceGeneration"
+            )
+        } else {
+            Log.d(
+                "UVC",
+                "UVC_HEALTH: attachSurface — same surface reattached hash=${System.identityHashCode(surface)} " +
+                    "generation=$currentSurfaceGeneration"
+            )
+        }
         currentSurface = surface
         surfaceReady = true
         Log.d(
@@ -342,6 +473,7 @@ class UvcController(
         )
         currentSurface = null
         surfaceReady = false
+        surfaceAttached = false
         stopPreviewPipeline()
     }
 
@@ -367,7 +499,7 @@ class UvcController(
      * from the native layer.  The USB connection and UVC context remain open
      * so the camera does not need to be re-probed on the next [attachSurface].
      *
-     * Sets [surfaceReady] to `false` and [streaming] to `false`.
+     * Sets [surfaceReady], [surfaceAttached], and [streaming] to `false`.
      */
     fun stopPreviewPipeline() {
         Log.d(
@@ -376,6 +508,7 @@ class UvcController(
                 "(stream stopped, camera session kept open)"
         )
         surfaceReady = false
+        surfaceAttached = false
         if (nativeHandle != 0L) {
             if (streaming) {
                 Log.d("UVC", "stopPreviewPipeline: invoking nativeStopStream")
@@ -428,6 +561,8 @@ class UvcController(
         // 2. Detach surface from native (does not clear currentSurface so the
         //    Java Surface reference survives and can be reattached after recovery).
         surfaceReady = false
+        surfaceAttached = false
+        attachedSurfaceGeneration = -1L
         if (nativeHandle != 0L) {
             NativeBridge.nativeSetSurface(nativeHandle, null)
             Log.d("UVC", "closeCameraSession: surface detached from native")
@@ -620,12 +755,264 @@ class UvcController(
         Log.d("UVC", "requestCapture (stub) — streaming=$streaming cameraOpened=$cameraOpened")
     }
 
+    // -----------------------------------------------------------------------
+    // Preview health monitoring
+    // -----------------------------------------------------------------------
+
+    /**
+     * Returns true when the entire preview pipeline is healthy and actively
+     * rendering frames on the current surface.
+     *
+     * All five conditions must be true simultaneously:
+     *  - camera opened ([cameraOpened])
+     *  - stream running ([streamRunning])
+     *  - native render path bound to current surface ([surfaceAttached])
+     *  - surface generation consistent ([currentSurfaceGeneration] == [attachedSurfaceGeneration])
+     *  - a frame was confirmed recently by [FrameCallback] (within 1500 ms)
+     *
+     * [now] defaults to the current elapsed-realtime clock and may be passed
+     * explicitly in tests.
+     */
+    fun isPreviewHealthy(now: Long = SystemClock.elapsedRealtime()): Boolean {
+        val recentFrame = lastFrameRenderedAtMs > 0L && (now - lastFrameRenderedAtMs) < 1500L
+        val healthy = cameraOpened &&
+            streamRunning &&
+            surfaceAttached &&
+            currentSurfaceGeneration == attachedSurfaceGeneration &&
+            recentFrame
+        Log.d(
+            "UVC",
+            "UVC_HEALTH: isPreviewHealthy=$healthy — " +
+                "cameraOpened=$cameraOpened streamRunning=$streamRunning " +
+                "surfaceAttached=$surfaceAttached " +
+                "currentSurfaceGeneration=$currentSurfaceGeneration " +
+                "attachedSurfaceGeneration=$attachedSurfaceGeneration " +
+                "lastFrameRenderedAtMs=$lastFrameRenderedAtMs " +
+                "recentFrame=$recentFrame"
+        )
+        return healthy
+    }
+
+    /**
+     * Evaluates the current preview state and returns the minimum recovery
+     * action needed.  Callers in lifecycle hooks use the returned value to
+     * dispatch to the appropriate (cheapest) recovery path.
+     *
+     * Decision priority (first matching rule wins):
+     *  1. Camera not open → [PreviewRecoveryDecision.HARD_RECOVER]
+     *  2. Camera open, stream not running → [PreviewRecoveryDecision.STREAM_RESTART_ONLY]
+     *  3. Camera open, stream running, surface not attached or generation mismatch
+     *     → [PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY]
+     *  4. Camera open, stream running, preview not healthy (no recent frames)
+     *     → [PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY]
+     *  5. Otherwise → [PreviewRecoveryDecision.NO_OP]
+     */
+    fun evaluatePreviewRecoveryNeeded(): PreviewRecoveryDecision {
+        val now = SystemClock.elapsedRealtime()
+        val decision = when {
+            !cameraOpened ->
+                PreviewRecoveryDecision.HARD_RECOVER
+
+            cameraOpened && !streamRunning ->
+                PreviewRecoveryDecision.STREAM_RESTART_ONLY
+
+            cameraOpened && streamRunning &&
+                (!surfaceAttached || currentSurfaceGeneration != attachedSurfaceGeneration) ->
+                PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY
+
+            cameraOpened && streamRunning && !isPreviewHealthy(now) ->
+                PreviewRecoveryDecision.SOFT_PREVIEW_RECOVERY
+
+            else -> PreviewRecoveryDecision.NO_OP
+        }
+        Log.d(
+            "UVC",
+            "UVC_HEALTH: evaluatePreviewRecoveryNeeded → $decision — " +
+                "cameraOpened=$cameraOpened streamRunning=$streamRunning " +
+                "surfaceAttached=$surfaceAttached " +
+                "currentSurfaceGeneration=$currentSurfaceGeneration " +
+                "attachedSurfaceGeneration=$attachedSurfaceGeneration " +
+                "lastFrameRenderedAtMs=$lastFrameRenderedAtMs"
+        )
+        return decision
+    }
+
+    /**
+     * Soft preview recovery: detach and re-attach the render surface, then
+     * restart only the MJPEG stream path.  Does NOT close the USB camera —
+     * the device session and UVC context stay open.
+     *
+     * Use when the camera is open and the stream may be running but the
+     * preview is black due to a stale surface binding or a stuck stream.
+     *
+     * Escalates automatically to [hardRecoverCameraSession] if [cameraOpened]
+     * is false (e.g. called after USB detach).
+     */
+    @Synchronized
+    fun softPreviewRecovery(surface: Surface) {
+        Log.d(
+            "UVC",
+            "UVC_HEALTH: softPreviewRecovery invoked — cameraOpened=$cameraOpened " +
+                "streamRunning=$streamRunning surfaceAttached=$surfaceAttached " +
+                "surfaceHash=${System.identityHashCode(surface)}"
+        )
+        if (!cameraOpened) {
+            Log.d("UVC", "UVC_HEALTH: softPreviewRecovery — camera not open, escalating to hardRecoverCameraSession")
+            hardRecoverCameraSession(surface)
+            return
+        }
+        if (nativeHandle == 0L) {
+            Log.w("UVC", "UVC_HEALTH: softPreviewRecovery — nativeHandle=0, cannot recover")
+            return
+        }
+
+        val isNewSurface = surface !== currentSurface
+        if (isNewSurface) {
+            currentSurfaceGeneration++
+            Log.d(
+                "UVC",
+                "UVC_HEALTH: softPreviewRecovery — new surface, generation=$currentSurfaceGeneration"
+            )
+        }
+        currentSurface = surface
+        surfaceReady = true
+
+        // Force render-path rebind: detach → stop stream → re-attach → restart stream.
+        // nativeCloseUsbCamera is deliberately NOT called — USB session stays open.
+        NativeBridge.nativeSetSurface(nativeHandle, null)
+        surfaceAttached = false
+        attachedSurfaceGeneration = -1L
+
+        if (streaming) {
+            Log.d("UVC", "UVC_HEALTH: softPreviewRecovery — stopping active stream")
+            NativeBridge.nativeStopStream(nativeHandle)
+            streaming = false
+        }
+
+        NativeBridge.nativeSetSurface(nativeHandle, surface)
+        surfaceAttached = true
+        attachedSurfaceGeneration = currentSurfaceGeneration
+        NativeBridge.nativeSetFrameListener(nativeHandle, frameCallback)
+
+        val ok = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
+        streaming = ok
+        Log.d(
+            "UVC",
+            "UVC_HEALTH: softPreviewRecovery complete — streaming=$ok " +
+                "surfaceAttached=$surfaceAttached attachedSurfaceGeneration=$attachedSurfaceGeneration"
+        )
+    }
+
+    /**
+     * Restart only the MJPEG stream without closing the USB camera.
+     *
+     * Use when the camera is open and the surface is already bound, but the
+     * stream needs to be explicitly cycled (stop → re-attach surface → start).
+     * Does nothing if the camera is not currently open.
+     */
+    fun restartPreviewStreamOnly() {
+        Log.d(
+            "UVC",
+            "UVC_HEALTH: restartPreviewStreamOnly — cameraOpened=$cameraOpened streaming=$streaming"
+        )
+        if (!cameraOpened || nativeHandle == 0L) {
+            Log.d("UVC", "UVC_HEALTH: restartPreviewStreamOnly — camera not open, skipping")
+            return
+        }
+        if (streaming) {
+            NativeBridge.nativeStopStream(nativeHandle)
+            streaming = false
+        }
+        val cs = currentSurface
+        if (cs != null && cs.isValid) {
+            NativeBridge.nativeSetSurface(nativeHandle, cs)
+            surfaceAttached = true
+            attachedSurfaceGeneration = currentSurfaceGeneration
+        }
+        NativeBridge.nativeSetFrameListener(nativeHandle, frameCallback)
+        val ok = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
+        streaming = ok
+        Log.d("UVC", "UVC_HEALTH: restartPreviewStreamOnly complete — streaming=$ok")
+    }
+
+    /**
+     * Detach only the native render surface without stopping the stream or
+     * closing the camera.  Use when the surface window is temporarily
+     * invalidated but the camera and stream should remain alive.
+     *
+     * Contrast with [stopPreviewPipeline], which stops the stream and detaches
+     * the surface, and [closeCameraSession], which does a full teardown.
+     */
+    fun detachSurfaceOnly() {
+        Log.d(
+            "UVC",
+            "UVC_HEALTH: detachSurfaceOnly — streaming=$streaming cameraOpened=$cameraOpened " +
+                "surfaceAttached=$surfaceAttached"
+        )
+        surfaceAttached = false
+        attachedSurfaceGeneration = -1L
+        if (nativeHandle != 0L) {
+            NativeBridge.nativeSetSurface(nativeHandle, null)
+            Log.d("UVC", "UVC_HEALTH: detachSurfaceOnly — nativeSetSurface(null) called, camera/stream preserved")
+        }
+    }
+
+    /**
+     * Schedule a one-shot post-resume health watchdog to fire ~1 300 ms from now.
+     *
+     * If the preview is still not healthy when it fires, [softPreviewRecovery]
+     * is invoked automatically.  Any previously scheduled watchdog is cancelled
+     * first so only one watchdog is pending at a time.
+     *
+     * Should be called from each lifecycle hook that may need recovery:
+     * [android.app.Activity.onResume], [android.view.SurfaceHolder.Callback.surfaceCreated],
+     * and [android.content.ServiceConnection.onServiceConnected].
+     */
+    fun schedulePreviewWatchdog() {
+        cancelPreviewWatchdog()
+        val r = Runnable {
+            watchdogRunnable = null
+            val now = SystemClock.elapsedRealtime()
+            val healthy = isPreviewHealthy(now)
+            Log.d(
+                "UVC",
+                "UVC_HEALTH: WATCHDOG fired — previewHealthy=$healthy " +
+                    "cameraOpened=$cameraOpened streamRunning=$streamRunning " +
+                    "surfaceAttached=$surfaceAttached " +
+                    "currentSurfaceGeneration=$currentSurfaceGeneration " +
+                    "attachedSurfaceGeneration=$attachedSurfaceGeneration " +
+                    "lastFrameRenderedAtMs=$lastFrameRenderedAtMs"
+            )
+            if (!healthy) {
+                val cs = currentSurface
+                if (cs != null && cs.isValid) {
+                    Log.d("UVC", "UVC_HEALTH: WATCHDOG — preview not healthy, triggering softPreviewRecovery")
+                    softPreviewRecovery(cs)
+                } else {
+                    Log.d("UVC", "UVC_HEALTH: WATCHDOG — no valid surface available; skipping soft recovery")
+                }
+            }
+        }
+        watchdogRunnable = r
+        mainHandler.postDelayed(r, 1300L)
+        Log.d("UVC", "UVC_HEALTH: WATCHDOG scheduled (1300 ms)")
+    }
+
+    private fun cancelPreviewWatchdog() {
+        watchdogRunnable?.let {
+            mainHandler.removeCallbacks(it)
+            watchdogRunnable = null
+            Log.d("UVC", "UVC_HEALTH: WATCHDOG cancelled")
+        }
+    }
+
     /**
      * Release all resources.  Called from [CameraService.onDestroy].
      * After this the controller must not be used again.
      */
     fun release() {
         Log.d("UVC", "UvcController.release")
+        cancelPreviewWatchdog()
         unregisterUsbReceiver()
 
         isOpening = false
@@ -634,6 +1021,9 @@ class UvcController(
         streaming = false
         cameraOpened = false
         surfaceReady = false
+        surfaceAttached = false
+        attachedSurfaceGeneration = -1L
+        lastFrameRenderedAtMs = 0L
         usbPermissionGranted = false
 
         if (nativeHandle != 0L) {
@@ -667,6 +1057,8 @@ class UvcController(
         usbPermissionGranted = false
         streaming = false
         cameraOpened = false
+        surfaceAttached = false
+        attachedSurfaceGeneration = -1L
         if (nativeHandle != 0L) {
             Log.d("UVC", "handleUsbDetach: invoking nativeStopStream")
             NativeBridge.nativeStopStream(nativeHandle)
@@ -679,7 +1071,7 @@ class UvcController(
         Log.d(
             "UVC",
             "UVC_STATE: FULL_TEARDOWN COMPLETE — reason=USB_DETACH: " +
-                "cameraOpened=false streaming=false surfaceReady=$surfaceReady"
+                "cameraOpened=false streaming=false surfaceReady=$surfaceReady surfaceAttached=false"
         )
     }
 
