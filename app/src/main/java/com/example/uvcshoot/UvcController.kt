@@ -87,6 +87,19 @@ class UvcController(
      */
     @Volatile private var isRecovering = false
 
+    /**
+     * Guard against duplicate back-to-back [openUsbConnectionAndSendToNative] calls.
+     * Set when an open sequence begins and cleared (in a finally block) when it
+     * completes (success or failure).  A second call while one is in progress is
+     * logged and suppressed immediately, preventing double-open races that arise
+     * when rapid lifecycle events (onResume + surfaceCreated + onServiceConnected
+     * or two USB-permission grants) all fire the open path in quick succession.
+     *
+     * Also cleared by [closeCameraSession] so a fresh open is always allowed
+     * after a hard teardown.
+     */
+    @Volatile private var isOpening = false
+
     /** Returns true while the MJPEG stream is running. */
     fun isStreaming(): Boolean = streaming
 
@@ -297,6 +310,9 @@ class UvcController(
             "closeCameraSession: hard teardown begin — streaming=$streaming " +
                 "cameraReady=$cameraReady nativeHandle=$nativeHandle"
         )
+        // Reset open guard so a fresh openUsbConnectionAndSendToNative is
+        // allowed after this teardown without hitting the duplicate-open guard.
+        isOpening = false
         stopPreviewPipeline()
         if (nativeHandle != 0L) {
             NativeBridge.nativeCloseUsbCamera(nativeHandle)
@@ -477,6 +493,8 @@ class UvcController(
         Log.d("UVC", "UvcController.release")
         unregisterUsbReceiver()
 
+        isOpening = false
+        isRecovering = false
         streaming = false
         cameraReady = false
         surfaceReady = false
@@ -501,8 +519,11 @@ class UvcController(
         Log.d("UVC", "handleUsbDetach: device detached — tearing down camera pipeline, preserving surface state")
         // Stop the stream and close the native/USB camera session.
         // surfaceReady is intentionally preserved: if the surface is still
-        // alive when the device reconnects, tryStartStream() will fire
-        // automatically inside openUsbConnectionAndSendToNative().
+        // alive when the device reconnects, the post-open step inside
+        // openUsbConnectionAndSendToNative() will call nativeSetSurface and
+        // start the stream automatically.
+        // Reset isOpening so a fresh open is allowed on re-attach.
+        isOpening = false
         streaming = false
         cameraReady = false
         if (nativeHandle != 0L) {
@@ -520,85 +541,104 @@ class UvcController(
     // -----------------------------------------------------------------------
 
     private fun openUsbConnectionAndSendToNative(device: UsbDevice) {
+        // Guard: if an open is already in flight, suppress this duplicate call.
+        // This prevents back-to-back nativeOpenUsbCamera invocations that occur
+        // when rapid lifecycle events (onResume + surfaceCreated + onServiceConnected,
+        // or two USB-permission grants from two requestPermission calls) all reach
+        // this path within milliseconds of each other.
+        if (isOpening) {
+            Log.d(
+                "UVC",
+                "openUsbConnectionAndSendToNative: DUPLICATE OPEN SUPPRESSED — " +
+                    "open already in progress for ${device.deviceName}"
+            )
+            return
+        }
+        isOpening = true
+        Log.d("UVC", "openUsbConnectionAndSendToNative: starting open for ${device.deviceName}")
+
+        // Close any leftover USB connection from a previous (failed) open before
+        // entering the guarded try block that owns isOpening.
         closeUsbConnection()
 
-        val connection = usbManager.openDevice(device)
-        if (connection == null) {
-            Log.e("UVC", "usbManager.openDevice returned null for ${device.deviceName}")
-            return
-        }
-        usbConnection = connection
+        try {
+            val connection = usbManager.openDevice(device)
+            if (connection == null) {
+                Log.e("UVC", "usbManager.openDevice returned null for ${device.deviceName}")
+                return
+            }
+            usbConnection = connection
 
-        val fd = connection.fileDescriptor
-        Log.d("UVC", "USB connection opened fd=$fd for ${device.deviceName}")
+            val fd = connection.fileDescriptor
+            Log.d("UVC", "USB connection opened fd=$fd for ${device.deviceName}")
 
-        if (nativeHandle == 0L) {
-            Log.e("UVC", "Native handle is 0 — cannot send USB device info")
-            return
-        }
+            if (nativeHandle == 0L) {
+                Log.e("UVC", "Native handle is 0 — cannot send USB device info")
+                return
+            }
 
-        val infoOk = NativeBridge.nativeSetUsbDeviceInfo(
-            nativeHandle, fd,
-            device.vendorId, device.productId,
-            device.deviceName
-        )
-        Log.d("UVC", "nativeSetUsbDeviceInfo result=$infoOk")
-        if (!infoOk) {
-            Log.e("UVC", "Failed to pass USB device info to native")
-            return
-        }
+            val infoOk = NativeBridge.nativeSetUsbDeviceInfo(
+                nativeHandle, fd,
+                device.vendorId, device.productId,
+                device.deviceName
+            )
+            Log.d("UVC", "nativeSetUsbDeviceInfo result=$infoOk")
+            if (!infoOk) {
+                Log.e("UVC", "Failed to pass USB device info to native")
+                return
+            }
 
-        val openOk = NativeBridge.nativeOpenUsbCamera(nativeHandle)
-        Log.d("UVC", "nativeOpenUsbCamera result=$openOk")
-        if (!openOk) {
-            Log.e("UVC", "nativeOpenUsbCamera failed")
-            return
-        }
+            val openOk = NativeBridge.nativeOpenUsbCamera(nativeHandle)
+            Log.d("UVC", "nativeOpenUsbCamera result=$openOk")
+            if (!openOk) {
+                Log.e("UVC", "nativeOpenUsbCamera failed")
+                return
+            }
 
-        val probeOk = NativeBridge.nativeProbeAndOpenUvc(nativeHandle)
-        Log.d("UVC", "nativeProbeAndOpenUvc result=$probeOk")
-        if (!probeOk) return
+            val probeOk = NativeBridge.nativeProbeAndOpenUvc(nativeHandle)
+            Log.d("UVC", "nativeProbeAndOpenUvc result=$probeOk")
+            if (!probeOk) {
+                Log.e("UVC", "nativeProbeAndOpenUvc failed — aborting post-open")
+                cameraReady = false
+                return
+            }
 
-        cameraReady = true
-        Log.d(
-            "UVC",
-            "openUsbConnectionAndSendToNative: USB open success — cameraReady=true " +
-                "surfaceReady=$surfaceReady currentSurface=${currentSurface != null}"
-        )
+            cameraReady = true
+            Log.d(
+                "UVC",
+                "POST-OPEN: camera open success — cameraReady=true " +
+                    "currentSurface=${currentSurface != null} surfaceReady=$surfaceReady"
+            )
 
-        // --- Explicit post-open step ---
-        // closeCameraSession() (called by hard recovery) detaches the surface from native
-        // (nativeSetSurface(null) + surfaceReady=false) but deliberately preserves
-        // currentSurface so it can be reattached here.  This ensures that after every
-        // successful camera open we deterministically reattach the surface and attempt
-        // to start the stream — exactly once.
-        if (!surfaceReady) {
+            // --- Deterministic post-open surface-attach + stream-start ---
+            // Always call nativeSetSurface explicitly here, regardless of
+            // whether the surface was "pre-attached" before the open.  The
+            // native camera open (nativeOpenUsbCamera / nativeProbeAndOpenUvc)
+            // may reset the native surface handle internally, making any
+            // pre-attached surface stale.  Relying on the pre-attached state
+            // (surfaceReady=true from hardRecoverCameraSession) was the root
+            // cause of the regression where the stream never started after a
+            // successful open.
             val cs = currentSurface
             if (cs != null && nativeHandle != 0L) {
+                Log.d("UVC", "POST-OPEN: valid surface found — invoking nativeSetSurface")
                 NativeBridge.nativeSetSurface(nativeHandle, cs)
                 surfaceReady = true
-                Log.d(
-                    "UVC",
-                    "openUsbConnectionAndSendToNative: currentSurface reattached after open — " +
-                        "surfaceReady=true, calling tryStartStream"
-                )
+                Log.d("UVC", "POST-OPEN: nativeSetSurface done — invoking nativeStartMjpegStream")
+                val streamOk = NativeBridge.nativeStartMjpegStream(nativeHandle, 1280, 720, 30)
+                streaming = streamOk
+                Log.d("UVC", "POST-OPEN: nativeStartMjpegStream result=$streamOk → streaming=$streaming")
             } else {
                 Log.d(
                     "UVC",
-                    "openUsbConnectionAndSendToNative: no surface available — " +
-                        "stream start deferred until attachSurface is called " +
-                        "(currentSurface=${currentSurface != null})"
+                    "POST-OPEN: skipping attach/start — no valid surface available " +
+                        "(currentSurface=${currentSurface != null} nativeHandle=$nativeHandle); " +
+                        "stream will start when attachSurface is called"
                 )
             }
-        } else {
-            Log.d(
-                "UVC",
-                "openUsbConnectionAndSendToNative: surfaceReady already true (surface was pre-attached) — " +
-                    "calling tryStartStream"
-            )
+        } finally {
+            isOpening = false
         }
-
-        tryStartStream()
     }
 
     private fun closeUsbConnection() {
